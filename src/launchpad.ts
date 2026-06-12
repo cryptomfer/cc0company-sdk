@@ -1,12 +1,16 @@
 import {
   createPublicClient,
+  createWalletClient,
   encodeAbiParameters,
+  encodeFunctionData,
   http,
   parseEther,
   parseEventLogs,
+  type Account,
   type Address,
   type Hash,
   type Hex,
+  type TransactionReceipt,
   type WalletClient,
 } from 'viem';
 import { base } from 'viem/chains';
@@ -116,11 +120,27 @@ export interface LaunchTokenResult {
 export interface Cc0ClientConfig {
   /** Viem WalletClient with an account (wagmi compatible). Base only for now. */
   walletClient?: WalletClient;
+  /**
+   * Alternative to `walletClient`: any viem Account — a WalletClient on Base is
+   * built internally. Works with `privateKeyToAccount(...)`, Coinbase CDP server
+   * wallets (`toAccount(cdpAccount)` from `@coinbase/cdp-sdk/viem`), or any other
+   * provider that exposes a viem-compatible account.
+   */
+  account?: Account;
   /** Optional viem PublicClient; a default Base client is created if omitted. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   publicClient?: any;
   /** cc0.company base URL for the launch registry. Override for self-hosted setups. */
   registryUrl?: string;
+}
+
+/** An unsigned launch transaction — sign + submit it with ANY wallet infra
+ *  (Bankr submit, CDP, a Safe, raw eth_sendTransaction…). */
+export interface PreparedLaunchTransaction {
+  to: Address;
+  data: Hex;
+  value: bigint;
+  chainId: number;
 }
 
 // ─── ABIs (minimal fragments) ────────────────────────────────────────────────
@@ -252,7 +272,13 @@ export class Cc0Launchpad {
   public readonly registryUrl: string;
 
   constructor(config: Cc0ClientConfig = {}) {
-    this.walletClient = config.walletClient;
+    // Accept either a ready WalletClient or any viem Account (private key, CDP
+    // server wallet via toAccount, …) — a Base WalletClient is built internally.
+    this.walletClient =
+      config.walletClient ??
+      (config.account
+        ? createWalletClient({ account: config.account, chain: base, transport: http() })
+        : undefined);
     this.publicClient =
       config.publicClient ?? createPublicClient({ chain: base, transport: http() });
     this.registryUrl = (config.registryUrl ?? 'https://cc0.company').replace(/\/$/, '');
@@ -284,10 +310,123 @@ export class Cc0Launchpad {
   }
 
   async launchToken(p: LaunchTokenParams): Promise<LaunchTokenResult> {
-    if (!this.walletClient) throw new Error('A walletClient is required to launch a token.');
+    if (!this.walletClient) {
+      throw new Error(
+        'A walletClient (or account) is required to launch. For unsigned-calldata flows (Bankr submit, Safes, …) use prepareLaunchTransaction() instead.',
+      );
+    }
     const account = this.walletClient.account;
     if (!account) throw new Error('walletClient has no account attached.');
     const creator = account.address as Address;
+
+    const { config, totalMsgValue } = await this.buildDeploymentConfig(p, creator);
+
+    const txHash = await this.walletClient.writeContract({
+      account,
+      address: this.contracts.FACTORY,
+      abi: FACTORY_ABI,
+      functionName: 'deployToken',
+      args: [config as never],
+      chain: base,
+      value: totalMsgValue,
+    });
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const tokenAddress = parseLaunchReceipt(receipt);
+    if (!tokenAddress) throw new Error('Launch succeeded but TokenCreated event was not found.');
+
+    // ── Auto-register on cc0.company ──────────────────────────────────────────
+    // Gives the token its page (chart, swap, fee-claim button) + makes it
+    // searchable. Best-effort: a registry hiccup never fails an on-chain launch.
+    let registered = false;
+    if (p.register !== false) {
+      registered = await this.registerLaunch({
+        tokenAddress,
+        txHash,
+        name: p.name,
+        symbol: p.symbol,
+        description: p.description,
+        image: p.image,
+        creator,
+        hasAirdrop: !!p.airdrop,
+      });
+    }
+
+    return { tokenAddress, txHash, registered };
+  }
+
+  /**
+   * Build the launch as an UNSIGNED transaction — for wallet infra that signs and
+   * submits itself (Bankr's submit endpoint, CDP raw sends, Safes, …). No wallet
+   * needed on this client; pass the `creator` who will send it (token admin +
+   * default fee recipient).
+   *
+   * After the transaction lands, finish the job with:
+   *   • `parseLaunchReceipt(receipt)` → the new token address
+   *   • `registerLaunch({...})`       → its page on cc0.company
+   */
+  async prepareLaunchTransaction(
+    p: LaunchTokenParams,
+    opts: { creator: Address },
+  ): Promise<PreparedLaunchTransaction> {
+    const { config, totalMsgValue } = await this.buildDeploymentConfig(p, opts.creator);
+    return {
+      to: this.contracts.FACTORY,
+      data: encodeFunctionData({
+        abi: FACTORY_ABI,
+        functionName: 'deployToken',
+        args: [config as never],
+      }),
+      value: totalMsgValue,
+      chainId: base.id,
+    };
+  }
+
+  /**
+   * Register a launch on cc0.company — token page (chart, swap, fee claim) +
+   * browse/search. `launchToken()` calls this automatically; use it directly for
+   * prepareLaunchTransaction flows. Returns true on success.
+   */
+  async registerLaunch(params: {
+    tokenAddress: Address;
+    txHash: Hash;
+    name: string;
+    symbol: string;
+    description?: string;
+    image?: string;
+    creator: Address;
+    hasAirdrop?: boolean;
+  }): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.registryUrl}/api/store/token-launches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token_address: params.tokenAddress,
+          chain: 'base',
+          tx_hash: params.txHash,
+          protocol: 'cc0strategy',
+          name: params.name,
+          symbol: params.symbol,
+          description: params.description || undefined,
+          image_url: params.image || undefined,
+          creator_wallet: params.creator,
+          has_airdrop: !!params.hasAirdrop,
+        }),
+        signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // ── Deployment-config assembly (shared by launchToken + prepare) ────────────
+
+  private async buildDeploymentConfig(
+    p: LaunchTokenParams,
+    creator: Address,
+  ): Promise<{ config: Record<string, unknown>; totalMsgValue: bigint }> {
     const c = this.contracts;
 
     // ── Creator slices (their 75%, splittable) ────────────────────────────────
@@ -556,62 +695,24 @@ export class Cc0Launchpad {
       extensionConfigs: extensions,
     };
 
-    const txHash = await this.walletClient.writeContract({
-      account,
-      address: c.FACTORY,
-      abi: FACTORY_ABI,
-      functionName: 'deployToken',
-      args: [config as never],
-      chain: base,
-      value: totalMsgValue,
-    });
-
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
-    const events = parseEventLogs({
-      abi: FACTORY_ABI,
-      eventName: 'TokenCreated',
-      logs: receipt.logs,
-    });
-    const tokenAddress = (events[0] as unknown as { args: { tokenAddress: Address } })?.args
-      ?.tokenAddress;
-    if (!tokenAddress) throw new Error('Launch succeeded but TokenCreated event was not found.');
-
-    // ── Auto-register on cc0.company ──────────────────────────────────────────
-    // Gives the token its page (chart, swap, fee-claim button) + makes it
-    // searchable. Best-effort: a registry hiccup never fails an on-chain launch.
-    let registered = false;
-    if (p.register !== false) {
-      registered = await this.registerLaunch({
-        token_address: tokenAddress,
-        chain: 'base',
-        tx_hash: txHash,
-        protocol: 'cc0strategy',
-        name: p.name,
-        symbol: p.symbol,
-        description: p.description || undefined,
-        image_url: p.image || undefined,
-        creator_wallet: creator,
-        has_airdrop: !!p.airdrop,
-      });
-    }
-
-    return { tokenAddress, txHash, registered };
+    return { config, totalMsgValue };
   }
+}
 
-  /** POST a launch to the cc0.company registry. Returns true on success. */
-  private async registerLaunch(body: Record<string, unknown>): Promise<boolean> {
-    try {
-      const res = await fetch(`${this.registryUrl}/api/store/token-launches`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
-      });
-      return res.ok;
-    } catch {
-      return false;
-    }
-  }
+/**
+ * Extract the launched token's address from a deployToken transaction receipt.
+ * Pairs with `prepareLaunchTransaction` flows where an external signer submitted
+ * the transaction. Returns null when the receipt has no TokenCreated event.
+ */
+export function parseLaunchReceipt(receipt: TransactionReceipt): Address | null {
+  const events = parseEventLogs({
+    abi: FACTORY_ABI,
+    eventName: 'TokenCreated',
+    logs: receipt.logs,
+  });
+  return (
+    (events[0] as unknown as { args: { tokenAddress: Address } })?.args?.tokenAddress ?? null
+  );
 }
 
 function randomSalt(): Hex {

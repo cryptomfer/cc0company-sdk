@@ -17,6 +17,31 @@ One peer dependency: [viem](https://viem.sh).
 npm install @cc0company/sdk viem
 ```
 
+## Wallets — what the SDK accepts
+
+Every client takes a viem `walletClient` **or** any viem `account`:
+
+```typescript
+// 1. Browser wallet (MetaMask, Rabby, …)
+const walletClient = createWalletClient({ chain: base, transport: custom(window.ethereum) });
+new Cc0Launchpad({ walletClient });
+
+// 2. Private key (server / agent)
+import { privateKeyToAccount } from 'viem/accounts';
+new Cc0Launchpad({ account: privateKeyToAccount('0x…') });
+
+// 3. Coinbase CDP server wallet — CDP ships a viem adapter
+import { CdpClient } from '@coinbase/cdp-sdk';
+import { toAccount } from '@coinbase/cdp-sdk/viem';
+const cdp = new CdpClient();
+const cdpAccount = await cdp.evm.getOrCreateAccount({ name: 'launcher' });
+new Cc0Launchpad({ account: toAccount(cdpAccount) });
+
+// 4. No keys at all (Bankr submit, Safe, any external signer):
+//    build the unsigned transaction and submit it yourself — see
+//    "Launching without a wallet" below.
+```
+
 ## Launch a token
 
 ```typescript
@@ -87,6 +112,38 @@ import { PROTOCOL_SPLIT } from '@cc0company/sdk';
 // { CREATOR_BPS: 7500, STAKING_BPS: 1500, TREASURY_BPS: 1000 }
 
 const { staking, treasury, admin } = await launchpad.getProtocolAddresses();
+```
+
+## Launching without a wallet (Bankr, Safe, external signers)
+
+If your wallet infra signs and submits transactions itself and never exposes keys,
+skip `launchToken()` and use the unsigned-calldata flow:
+
+```typescript
+import { Cc0Launchpad, parseLaunchReceipt } from '@cc0company/sdk';
+
+const launchpad = new Cc0Launchpad(); // no wallet needed
+
+// 1. Build the unsigned transaction
+const tx = await launchpad.prepareLaunchTransaction(
+  { name: 'My Token', symbol: 'MTK', image: 'ipfs://…', feeTier: 1 },
+  { creator: '0xYourSenderAddress' }, // MUST be the address that submits it
+);
+// → { to, data, value, chainId } — submit with Bankr, a Safe, eth_sendTransaction…
+
+// 2. Once it lands, extract the token address from the receipt
+const tokenAddress = parseLaunchReceipt(receipt);
+
+// 3. Register it on cc0.company (launchToken does this automatically;
+//    here you call it yourself)
+await launchpad.registerLaunch({
+  tokenAddress,
+  txHash: receipt.transactionHash,
+  name: 'My Token',
+  symbol: 'MTK',
+  image: 'ipfs://…',
+  creator: '0xYourSenderAddress',
+});
 ```
 
 ## Claim your creator fees
