@@ -1,0 +1,54 @@
+{
+  "name": "@cc0company/sdk",
+  "version": "1.0.0",
+  "description": "Official SDK for cc0.company — launch tokens on the launchpad (75/15/10 enforced on-chain), claim creator fees, and stake $cc0company. Built for humans & AI agents.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "cc0",
+    "cc0company",
+    "launchpad",
+    "base",
+    "uniswap-v4",
+    "token",
+    "staking",
+    "viem",
+    "ai-agents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cryptomfer/cc0company-sdk.git"
+  },
+  "homepage": "https://cc0.company/docs/launchpad-sdk",
+  "license": "CC0-1.0",
+  "peerDependencies": {
+    "viem": ">=2.0.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "viem": "^2.21.0"
+  }
+}
