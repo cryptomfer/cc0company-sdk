@@ -68,11 +68,27 @@ export interface CreatorRewardSlice {
   feePreference?: CreatorFeePreference;
 }
 
+/**
+ * The token image. The URI is written ON-CHAIN FOREVER at launch, so the SDK
+ * guarantees permanence: anything that isn't already `ipfs://` is pinned to
+ * IPFS through cc0.company before launching. Accepts:
+ *   • an `ipfs://` URI               → used as-is
+ *   • an `https://` URL              → mirrored to IPFS server-side
+ *   • a `data:` URL, Blob/File, or Uint8Array → uploaded + pinned
+ */
+export type LaunchImage = string | Uint8Array | Blob;
+
 export interface LaunchTokenParams {
   name: string;
   symbol: string;
-  /** Token image URL (IPFS recommended) — stored on-chain with the token. */
-  image: string;
+  /** Token image — pinned to IPFS automatically unless already `ipfs://`. */
+  image: LaunchImage;
+  /**
+   * 'pin' (default): guarantee permanence — non-ipfs images are pinned to IPFS
+   * via cc0.company before launch (the launch FAILS if pinning fails, rather
+   * than writing a rottable URL on-chain). 'as-is': trust the provided URL.
+   */
+  imagePolicy?: 'pin' | 'as-is';
   /** Description + socials are stored on-chain in the token metadata. */
   description?: string;
   socials?: string[];
@@ -309,6 +325,58 @@ export class Cc0Launchpad {
     }
   }
 
+  /**
+   * Pin an image to IPFS through cc0.company (Pinata-backed). Used automatically
+   * by launchToken / prepareLaunchTransaction; call it directly if you want the
+   * `ipfs://` URI up front.
+   */
+  async pinImage(input: LaunchImage): Promise<{ cid: string; ipfsUri: string; gatewayUrl: string }> {
+    const endpoint = `${this.registryUrl}/api/store/launchpad/pin-image`;
+    let res: Response;
+
+    if (typeof input === 'string' && !input.startsWith('data:')) {
+      // Remote URL — mirrored to IPFS server-side.
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: input }),
+      });
+    } else {
+      // Raw bytes (Uint8Array / Blob / data: URL) — multipart upload.
+      let blob: Blob;
+      if (typeof input === 'string') {
+        blob = await (await fetch(input)).blob(); // data: URL
+      } else if (input instanceof Uint8Array) {
+        blob = new Blob([input as BlobPart], { type: sniffImageMime(input) });
+      } else {
+        blob = input.type ? input : new Blob([input], { type: sniffImageMime(new Uint8Array(await input.arrayBuffer())) });
+      }
+      const form = new FormData();
+      form.append('file', blob, 'token-image');
+      res = await fetch(endpoint, { method: 'POST', body: form });
+    }
+
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json?.success || !json?.ipfs_uri) {
+      throw new Error(
+        `Image pinning failed${json?.error ? `: ${json.error}` : ''} — the image URI is written on-chain forever, so the launch refuses a non-permanent URL. Pass an ipfs:// URI, or set imagePolicy: 'as-is' to bypass.`,
+      );
+    }
+    return { cid: json.cid, ipfsUri: json.ipfs_uri, gatewayUrl: json.gateway_url };
+  }
+
+  /** Resolve any LaunchImage into the URI to write on-chain, honouring imagePolicy. */
+  private async resolveImage(image: LaunchImage, policy: 'pin' | 'as-is'): Promise<string> {
+    if (typeof image === 'string' && image.startsWith('ipfs://')) return image;
+    if (policy === 'as-is') {
+      if (typeof image !== 'string') {
+        throw new Error("imagePolicy 'as-is' requires the image to be a URL string.");
+      }
+      return image;
+    }
+    return (await this.pinImage(image)).ipfsUri;
+  }
+
   async launchToken(p: LaunchTokenParams): Promise<LaunchTokenResult> {
     if (!this.walletClient) {
       throw new Error(
@@ -319,7 +387,7 @@ export class Cc0Launchpad {
     if (!account) throw new Error('walletClient has no account attached.');
     const creator = account.address as Address;
 
-    const { config, totalMsgValue } = await this.buildDeploymentConfig(p, creator);
+    const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(p, creator);
 
     const txHash = await this.walletClient.writeContract({
       account,
@@ -346,7 +414,7 @@ export class Cc0Launchpad {
         name: p.name,
         symbol: p.symbol,
         description: p.description,
-        image: p.image,
+        image: imageUri,
         creator,
         hasAirdrop: !!p.airdrop,
       });
@@ -426,8 +494,12 @@ export class Cc0Launchpad {
   private async buildDeploymentConfig(
     p: LaunchTokenParams,
     creator: Address,
-  ): Promise<{ config: Record<string, unknown>; totalMsgValue: bigint }> {
+  ): Promise<{ config: Record<string, unknown>; totalMsgValue: bigint; imageUri: string }> {
     const c = this.contracts;
+
+    // Pin the image FIRST — its URI goes on-chain forever, so permanence is
+    // guaranteed before any transaction is built (fail-closed by default).
+    const imageUri = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
 
     // ── Creator slices (their 75%, splittable) ────────────────────────────────
     const creatorSlices: CreatorRewardSlice[] =
@@ -669,7 +741,7 @@ export class Cc0Launchpad {
         name: p.name,
         symbol: p.symbol,
         salt: p.salt ?? randomSalt(),
-        image: p.image,
+        image: imageUri,
         metadata: JSON.stringify({ description: p.description ?? '', socials: p.socials ?? [] }),
         context: 'cc0company-sdk',
         originatingChainId: BigInt(8453),
@@ -695,8 +767,18 @@ export class Cc0Launchpad {
       extensionConfigs: extensions,
     };
 
-    return { config, totalMsgValue };
+    return { config, totalMsgValue, imageUri };
   }
+}
+
+/** Best-effort image MIME detection from magic bytes (for raw Uint8Array inputs). */
+function sniffImageMime(bytes: Uint8Array): string {
+  if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+  if (bytes[0] === 0x47 && bytes[1] === 0x49) return 'image/gif';
+  if (bytes.length > 11 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+  if (bytes[0] === 0x3c) return 'image/svg+xml';
+  return 'image/png';
 }
 
 /**

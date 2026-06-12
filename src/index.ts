@@ -14,6 +14,7 @@ export type {
   Cc0ClientConfig,
   LaunchTokenParams,
   LaunchTokenResult,
+  LaunchImage,
   PreparedLaunchTransaction,
   CreatorRewardSlice,
   CreatorFeePreference,

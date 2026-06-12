@@ -59,14 +59,30 @@ const launchpad = new Cc0Launchpad({ walletClient });
 const { tokenAddress, txHash } = await launchpad.launchToken({
   name: 'My Token',
   symbol: 'MTK',
-  image: 'ipfs://QmYourImageHash', // stored on-chain
-  description: 'My awesome token', // stored on-chain
-  feeTier: 1,                      // 1 | 2 | 3 % static LP fee, or feeMode: 'dynamic'
+  image: 'https://my.site/art.png', // ANY url or raw bytes — pinned to IPFS for you
+  description: 'My awesome token',  // stored on-chain
+  feeTier: 1,                       // 1 | 2 | 3 % static LP fee, or feeMode: 'dynamic'
 });
 ```
 
 One transaction: token + Uniswap V4 pool + locked LP + fee split, atomically.
 The token trades the moment it lands.
+
+## Token images — IPFS, guaranteed
+
+The image URI is written **on-chain forever** at launch, so the SDK refuses to
+write a rottable URL. Whatever you pass is normalized to `ipfs://` (pinned
+through cc0.company's infrastructure) before the transaction is built:
+
+| You pass | What happens |
+|----------|--------------|
+| `ipfs://CID` | Used as-is |
+| `https://…` URL | Mirrored to IPFS server-side |
+| `data:` URL, `Blob`/`File`, `Uint8Array` | Uploaded + pinned (8MB max, images only) |
+
+If pinning fails, **the launch fails** — by design. Escape hatch:
+`imagePolicy: 'as-is'` trusts your URL verbatim. Need the URI up front?
+`await launchpad.pinImage(input)` → `{ cid, ipfsUri, gatewayUrl }`.
 
 ### All launch options
 
