@@ -124,24 +124,24 @@ await staking.withdraw();                        // after the cooldown
 await staking.exit();                            // claim all + unstake all, one tx
 ```
 
-## Register your launch on cc0.company (optional, recommended)
+## Your token on cc0.company — automatic
 
-The launch is fully on-chain either way, but registering gives your token a page
-(chart, swap, claim button) and makes it searchable:
+Every launch is **registered on cc0.company automatically**: your token gets its page
+at `cc0.company/token/{address}` — live chart, swap widget, a one-tap claim button for
+your fees — and shows up in browse + search. Nothing to do.
 
-```bash
-POST https://cc0.company/api/store/token-launches
-{
-  "token_address": "0x…",
-  "chain": "base",
-  "tx_hash": "0x…",
-  "protocol": "cc0strategy",
-  "name": "My Token",
-  "symbol": "MTK",
-  "image_url": "ipfs://…",
-  "creator_wallet": "0x…"
-}
+```typescript
+const { tokenAddress, registered } = await launchpad.launchToken({ ... });
+// registered === true → your token page is live
+// registered === false → the registry was unreachable; the token is still fully
+//                        live on-chain (registration is never allowed to fail a launch)
 ```
+
+Opt out with `register: false`, or point the SDK at a self-hosted registry via
+`new Cc0Launchpad({ walletClient, registryUrl: 'https://...' })`.
+
+Integrating at the raw contract level without this SDK? Register by POSTing the same
+payload yourself — see [cc0.company/docs/launchpad-sdk](https://cc0.company/docs/launchpad-sdk).
 
 ## Contracts (Base mainnet)
 

@@ -96,11 +96,21 @@ export interface LaunchTokenParams {
   devBuyEth?: string;
   /** Custom salt; random if omitted. */
   salt?: Hex;
+  /**
+   * Every launch is registered on cc0.company automatically (token page, chart,
+   * swap, fee-claim button, search). Set to false to skip — the token still works
+   * fully on-chain, it just won't appear on the platform.
+   */
+  register?: boolean;
 }
 
 export interface LaunchTokenResult {
   tokenAddress: Address;
   txHash: Hash;
+  /** Whether the launch was registered on cc0.company (token page, chart, swap,
+   *  claim button). Launches are registered automatically; `false` means the
+   *  registry was unreachable — the token is still fully live on-chain. */
+  registered: boolean;
 }
 
 export interface Cc0ClientConfig {
@@ -109,6 +119,8 @@ export interface Cc0ClientConfig {
   /** Optional viem PublicClient; a default Base client is created if omitted. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   publicClient?: any;
+  /** cc0.company base URL for the launch registry. Override for self-hosted setups. */
+  registryUrl?: string;
 }
 
 // ─── ABIs (minimal fragments) ────────────────────────────────────────────────
@@ -237,11 +249,13 @@ export class Cc0Launchpad {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
   public readonly contracts = CC0_CONTRACTS.base;
+  public readonly registryUrl: string;
 
   constructor(config: Cc0ClientConfig = {}) {
     this.walletClient = config.walletClient;
     this.publicClient =
       config.publicClient ?? createPublicClient({ chain: base, transport: http() });
+    this.registryUrl = (config.registryUrl ?? 'https://cc0.company').replace(/\/$/, '');
   }
 
   /**
@@ -562,7 +576,41 @@ export class Cc0Launchpad {
       ?.tokenAddress;
     if (!tokenAddress) throw new Error('Launch succeeded but TokenCreated event was not found.');
 
-    return { tokenAddress, txHash };
+    // ── Auto-register on cc0.company ──────────────────────────────────────────
+    // Gives the token its page (chart, swap, fee-claim button) + makes it
+    // searchable. Best-effort: a registry hiccup never fails an on-chain launch.
+    let registered = false;
+    if (p.register !== false) {
+      registered = await this.registerLaunch({
+        token_address: tokenAddress,
+        chain: 'base',
+        tx_hash: txHash,
+        protocol: 'cc0strategy',
+        name: p.name,
+        symbol: p.symbol,
+        description: p.description || undefined,
+        image_url: p.image || undefined,
+        creator_wallet: creator,
+        has_airdrop: !!p.airdrop,
+      });
+    }
+
+    return { tokenAddress, txHash, registered };
+  }
+
+  /** POST a launch to the cc0.company registry. Returns true on success. */
+  private async registerLaunch(body: Record<string, unknown>): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.registryUrl}/api/store/token-launches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
   }
 }
 
