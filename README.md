@@ -19,27 +19,61 @@ npm install @cc0company/sdk viem
 
 ## Wallets — what the SDK accepts
 
-Every client takes a viem `walletClient` **or** any viem `account`:
+Every client (`Cc0Launchpad`, `Cc0Fees`, `Cc0Staking`) takes ONE of three signers:
 
 ```typescript
-// 1. Browser wallet (MetaMask, Rabby, …)
+// 1. Browser wallet (MetaMask, Rabby, …) — viem walletClient
 const walletClient = createWalletClient({ chain: base, transport: custom(window.ethereum) });
 new Cc0Launchpad({ walletClient });
 
-// 2. Private key (server / agent)
+// 2. Private key (server / agent) — viem account
 import { privateKeyToAccount } from 'viem/accounts';
 new Cc0Launchpad({ account: privateKeyToAccount('0x…') });
 
-// 3. Coinbase CDP server wallet — CDP ships a viem adapter
-import { CdpClient } from '@coinbase/cdp-sdk';
-import { toAccount } from '@coinbase/cdp-sdk/viem';
-const cdp = new CdpClient();
-const cdpAccount = await cdp.evm.getOrCreateAccount({ name: 'launcher' });
-new Cc0Launchpad({ account: toAccount(cdpAccount) });
+// 3. ANY other wallet infra (Coinbase CDP, Bankr, Safe, relayers) — a `sender`:
+//    { address, send }. The SDK builds + gas-estimates the tx; your infra signs
+//    and submits it; the SDK waits, parses, and registers. `tx.json` is the
+//    BigInt-free mirror for JSON transports.
+new Cc0Launchpad({
+  sender: {
+    address: '0xYourSignerAddress',
+    send: async (tx) => {
+      const hash = await yourInfra.sendTransaction(tx.json); // { to, data, value, gas, chainId } — all hex
+      return hash;
+    },
+  },
+});
+```
 
-// 4. No keys at all (Bankr submit, Safe, any external signer):
-//    build the unsigned transaction and submit it yourself — see
-//    "Launching without a wallet" below.
+### Coinbase CDP recipe (proven in production)
+
+CDP's account objects are not viem-compatible — use a `sender`:
+
+```typescript
+import { CdpClient } from '@coinbase/cdp-sdk';
+import { Cc0Launchpad } from '@cc0company/sdk';
+
+const cdp = new CdpClient();
+const account = await cdp.evm.getOrCreateAccount({ name: 'launcher' });
+
+const launchpad = new Cc0Launchpad({
+  sender: {
+    address: account.address,
+    send: async (tx) => {
+      const { transactionHash } = await cdp.evm.sendTransaction({
+        address: account.address,
+        network: 'base',
+        // tx.json is JSON-safe (hex value + gas). Add EIP-1559 fee fields here
+        // if your CDP version wants them — gas limit is already estimated.
+        transaction: { to: tx.json.to, data: tx.json.data, value: tx.json.value, gas: tx.json.gas },
+      });
+      return transactionHash;
+    },
+  },
+});
+
+// Now EVERYTHING just works — launch, claim fees, stake:
+const { tokenAddress, registered } = await launchpad.launchToken({ ... });
 ```
 
 ## Launch a token
@@ -130,35 +164,31 @@ import { PROTOCOL_SPLIT } from '@cc0company/sdk';
 const { staking, treasury, admin } = await launchpad.getProtocolAddresses();
 ```
 
-## Launching without a wallet (Bankr, Safe, external signers)
+## Fully manual flow (when even `sender` is too much)
 
-If your wallet infra signs and submits transactions itself and never exposes keys,
-skip `launchToken()` and use the unsigned-calldata flow:
+Prefer the `sender` config above — `launchToken()` then handles everything. But if
+you want raw control:
 
 ```typescript
-import { Cc0Launchpad, parseLaunchReceipt } from '@cc0company/sdk';
+import { Cc0Launchpad } from '@cc0company/sdk';
 
-const launchpad = new Cc0Launchpad(); // no wallet needed
+const launchpad = new Cc0Launchpad(); // no signer at all
 
-// 1. Build the unsigned transaction
+// 1. Build the unsigned transaction (image pinned to IPFS, gas estimated +20%)
 const tx = await launchpad.prepareLaunchTransaction(
-  { name: 'My Token', symbol: 'MTK', image: 'ipfs://…', feeTier: 1 },
+  { name: 'My Token', symbol: 'MTK', image: imageBytes, feeTier: 1 },
   { creator: '0xYourSenderAddress' }, // MUST be the address that submits it
 );
-// → { to, data, value, chainId } — submit with Bankr, a Safe, eth_sendTransaction…
+// → { to, data, value, chainId, gas, imageUri, json }
+//   tx.json = BigInt-free (hex) — pass it straight to JSON transports.
 
-// 2. Once it lands, extract the token address from the receipt
-const tokenAddress = parseLaunchReceipt(receipt);
-
-// 3. Register it on cc0.company (launchToken does this automatically;
-//    here you call it yourself)
-await launchpad.registerLaunch({
-  tokenAddress,
-  txHash: receipt.transactionHash,
-  name: 'My Token',
-  symbol: 'MTK',
-  image: 'ipfs://…',
+// 2. Submit through your infra → txHash, then ONE call finishes everything
+//    (waits for the receipt, extracts the token address, registers the page):
+const { tokenAddress, registered } = await launchpad.finishLaunch({
+  txHash,
+  params: { name: 'My Token', symbol: 'MTK' },
   creator: '0xYourSenderAddress',
+  imageUri: tx.imageUri,
 });
 ```
 

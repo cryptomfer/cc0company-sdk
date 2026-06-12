@@ -1,14 +1,18 @@
 import {
   createPublicClient,
+  createWalletClient,
+  encodeFunctionData,
   http,
   type Address,
   type Hash,
+  type Hex,
   type WalletClient,
 } from 'viem';
 import { base } from 'viem/chains';
 
 import { CC0_CONTRACTS } from './addresses';
-import type { Cc0ClientConfig } from './launchpad';
+import { toPreparedTx } from './launchpad';
+import type { Cc0ClientConfig, ExternalSender } from './launchpad';
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // CREATOR FEES — read and claim a token creator's accrued trading fees.
@@ -71,12 +75,18 @@ export interface ClaimFeesResult {
  */
 export class Cc0Fees {
   public readonly walletClient?: WalletClient;
+  public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
   public readonly contracts = CC0_CONTRACTS.base;
 
   constructor(config: Cc0ClientConfig = {}) {
-    this.walletClient = config.walletClient;
+    this.walletClient =
+      config.walletClient ??
+      (config.account
+        ? createWalletClient({ account: config.account, chain: base, transport: http() })
+        : undefined);
+    this.sender = config.sender;
     this.publicClient =
       config.publicClient ?? createPublicClient({ chain: base, transport: http() });
   }
@@ -103,40 +113,55 @@ export class Cc0Fees {
   /**
    * Claim everything accrued for `feeOwner` on `token` — first WETH, then the token
    * (one transaction each, skipped when the balance is zero). Permissionless: the
-   * connected wallet pays gas, the funds go to `feeOwner`.
+   * configured signer pays gas, the funds go to `feeOwner`. Works with a
+   * walletClient / account OR an ExternalSender (CDP, Bankr, Safe, …).
    */
   async claimFees(feeOwner: Address, token: Address): Promise<ClaimFeesResult> {
-    if (!this.walletClient) throw new Error('A walletClient is required to claim.');
-    const account = this.walletClient.account;
-    if (!account) throw new Error('walletClient has no account attached.');
-
     const claimable = await this.getClaimableFees(feeOwner, token);
     const result: ClaimFeesResult = { wethTxHash: null, tokenTxHash: null };
 
     if (claimable.weth > BigInt(0)) {
-      result.wethTxHash = await this.walletClient.writeContract({
-        account,
-        address: this.contracts.FEE_LOCKER,
-        abi: FEE_LOCKER_ABI,
-        functionName: 'claim',
-        args: [feeOwner, this.contracts.WETH],
-        chain: base,
-      });
-      await this.publicClient.waitForTransactionReceipt({ hash: result.wethTxHash });
+      result.wethTxHash = await this.submitClaim(feeOwner, this.contracts.WETH);
     }
-
     if (claimable.token > BigInt(0)) {
-      result.tokenTxHash = await this.walletClient.writeContract({
-        account,
-        address: this.contracts.FEE_LOCKER,
-        abi: FEE_LOCKER_ABI,
-        functionName: 'claim',
-        args: [feeOwner, token],
+      result.tokenTxHash = await this.submitClaim(feeOwner, token);
+    }
+    return result;
+  }
+
+  /** Submit one claim through whichever signer is configured, and wait for it. */
+  private async submitClaim(feeOwner: Address, token: Address): Promise<Hash> {
+    const to = this.contracts.FEE_LOCKER;
+    const data: Hex = encodeFunctionData({
+      abi: FEE_LOCKER_ABI,
+      functionName: 'claim',
+      args: [feeOwner, token],
+    });
+
+    let hash: Hash;
+    if (this.walletClient?.account) {
+      hash = await this.walletClient.sendTransaction({
+        account: this.walletClient.account,
+        to,
+        data,
         chain: base,
       });
-      await this.publicClient.waitForTransactionReceipt({ hash: result.tokenTxHash });
+    } else if (this.sender) {
+      let gas = BigInt(400_000); // claims are cheap; generous fallback
+      try {
+        const estimated = (await this.publicClient.estimateGas({
+          account: this.sender.address,
+          to,
+          data,
+        })) as bigint;
+        gas = (estimated * BigInt(120)) / BigInt(100);
+      } catch { /* keep fallback */ }
+      hash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas));
+    } else {
+      throw new Error('A walletClient, account, or sender is required to claim.');
     }
 
-    return result;
+    await this.publicClient.waitForTransactionReceipt({ hash });
+    return hash;
   }
 }

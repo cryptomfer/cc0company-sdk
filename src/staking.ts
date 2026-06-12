@@ -1,14 +1,19 @@
 import {
   createPublicClient,
+  createWalletClient,
+  encodeFunctionData,
   http,
+  type Abi,
   type Address,
   type Hash,
+  type Hex,
   type WalletClient,
 } from 'viem';
 import { base } from 'viem/chains';
 
 import { CC0_CONTRACTS } from './addresses';
-import type { Cc0ClientConfig } from './launchpad';
+import { toPreparedTx } from './launchpad';
+import type { Cc0ClientConfig, ExternalSender } from './launchpad';
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // STAKING — stake $cc0company, earn WETH from the 15% staker share of every
@@ -76,12 +81,18 @@ export interface StakingPosition {
  */
 export class Cc0Staking {
   public readonly walletClient?: WalletClient;
+  public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
   public readonly contracts = CC0_CONTRACTS.base;
 
   constructor(config: Cc0ClientConfig = {}) {
-    this.walletClient = config.walletClient;
+    this.walletClient =
+      config.walletClient ??
+      (config.account
+        ? createWalletClient({ account: config.account, chain: base, transport: http() })
+        : undefined);
+    this.sender = config.sender;
     this.publicClient =
       config.publicClient ?? createPublicClient({ chain: base, transport: http() });
   }
@@ -117,27 +128,26 @@ export class Cc0Staking {
    * instead). Earning starts in the same block.
    */
   async stake(amount: bigint, opts: { autoApprove?: boolean } = {}): Promise<Hash> {
-    const { account } = this.requireWallet();
+    const signer = this.signerAddress();
     const autoApprove = opts.autoApprove ?? true;
 
     const allowance = (await this.publicClient.readContract({
       address: this.contracts.CC0COMPANY,
       abi: ERC20_ABI,
       functionName: 'allowance',
-      args: [account.address, this.contracts.STAKING],
+      args: [signer, this.contracts.STAKING],
     })) as bigint;
 
     if (allowance < amount) {
       if (!autoApprove) throw new Error('Insufficient allowance and autoApprove is disabled.');
-      const approveHash = await this.walletClient!.writeContract({
-        account,
-        address: this.contracts.CC0COMPANY,
-        abi: ERC20_ABI,
-        functionName: 'approve',
-        args: [this.contracts.STAKING, amount],
-        chain: base,
-      });
-      await this.publicClient.waitForTransactionReceipt({ hash: approveHash });
+      await this.submit(
+        this.contracts.CC0COMPANY,
+        encodeFunctionData({
+          abi: ERC20_ABI,
+          functionName: 'approve',
+          args: [this.contracts.STAKING, amount],
+        }),
+      );
     }
 
     return this.send('stake', [amount]);
@@ -170,23 +180,44 @@ export class Cc0Staking {
 
   // ── Internals ──────────────────────────────────────────────────────────────
 
-  private requireWallet() {
-    if (!this.walletClient) throw new Error('A walletClient is required for this action.');
-    const account = this.walletClient.account;
-    if (!account) throw new Error('walletClient has no account attached.');
-    return { account };
+  /** Address of whichever signer is configured (walletClient account or sender). */
+  private signerAddress(): Address {
+    if (this.walletClient?.account) return this.walletClient.account.address as Address;
+    if (this.sender) return this.sender.address;
+    throw new Error('A walletClient, account, or sender is required for this action.');
   }
 
   private async send(fn: string, args: unknown[]): Promise<Hash> {
-    const { account } = this.requireWallet();
-    const hash = await this.walletClient!.writeContract({
-      account,
-      address: this.contracts.STAKING,
-      abi: STAKING_ABI,
-      functionName: fn as never,
-      args: args as never,
-      chain: base,
-    });
+    return this.submit(
+      this.contracts.STAKING,
+      encodeFunctionData({ abi: STAKING_ABI as Abi, functionName: fn, args }),
+    );
+  }
+
+  /** Submit raw calldata through whichever signer is configured, and wait for it. */
+  private async submit(to: Address, data: Hex): Promise<Hash> {
+    let hash: Hash;
+    if (this.walletClient?.account) {
+      hash = await this.walletClient.sendTransaction({
+        account: this.walletClient.account,
+        to,
+        data,
+        chain: base,
+      });
+    } else if (this.sender) {
+      let gas = BigInt(500_000); // staking ops are light; generous fallback
+      try {
+        const estimated = (await this.publicClient.estimateGas({
+          account: this.sender.address,
+          to,
+          data,
+        })) as bigint;
+        gas = (estimated * BigInt(120)) / BigInt(100);
+      } catch { /* keep fallback */ }
+      hash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas));
+    } else {
+      throw new Error('A walletClient, account, or sender is required for this action.');
+    }
     await this.publicClient.waitForTransactionReceipt({ hash });
     return hash;
   }

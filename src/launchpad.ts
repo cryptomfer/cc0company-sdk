@@ -133,30 +133,61 @@ export interface LaunchTokenResult {
   registered: boolean;
 }
 
+/**
+ * An unsigned transaction ready for ANY signer. `json` is the BigInt-free mirror
+ * (hex-encoded value/gas) for transports that JSON-serialize (CDP sendTransaction,
+ * HTTP relayers, Bankr) — pass it straight through, no serialization gymnastics.
+ */
+export interface PreparedTransaction {
+  to: Address;
+  data: Hex;
+  value: bigint;
+  chainId: number;
+  /** Estimated gas limit with a 20% buffer (deployToken is heavy: ~10-15M). */
+  gas: bigint;
+  /** JSON-safe mirror: { to, data, value: '0x…', chainId, gas: '0x…' }. */
+  json: { to: Address; data: Hex; value: Hex; chainId: number; gas: Hex };
+}
+
+/** A prepared launch — also carries the resolved on-chain image URI. */
+export interface PreparedLaunchTransaction extends PreparedTransaction {
+  /** The ipfs:// URI that was written into the token config (already pinned). */
+  imageUri: string;
+}
+
+/**
+ * Wallet-provider-agnostic signer: anything that can take an unsigned tx and
+ * return its hash — Coinbase CDP `sendTransaction`, Bankr submit, a Safe, a raw
+ * JSON-RPC relayer. With a `sender`, EVERY SDK method works without viem wallet
+ * plumbing: the SDK prepares, your infra signs + submits, the SDK finishes.
+ */
+export interface ExternalSender {
+  /** The address your infra signs with (= creator / fee payer). */
+  address: Address;
+  /** Submit the transaction, return its hash. Use `tx.json` for JSON transports. */
+  send: (tx: PreparedTransaction) => Promise<Hash>;
+}
+
 export interface Cc0ClientConfig {
   /** Viem WalletClient with an account (wagmi compatible). Base only for now. */
   walletClient?: WalletClient;
   /**
    * Alternative to `walletClient`: any viem Account — a WalletClient on Base is
-   * built internally. Works with `privateKeyToAccount(...)`, Coinbase CDP server
-   * wallets (`toAccount(cdpAccount)` from `@coinbase/cdp-sdk/viem`), or any other
-   * provider that exposes a viem-compatible account.
+   * built internally. Works with `privateKeyToAccount(...)` and any provider
+   * that exposes a viem-compatible account.
    */
   account?: Account;
+  /**
+   * Alternative to both: a wallet-provider-agnostic sender (Coinbase CDP, Bankr,
+   * Safe, any relayer). The SDK builds + estimates the tx, your `send` submits
+   * it, the SDK waits/parses/registers. See ExternalSender.
+   */
+  sender?: ExternalSender;
   /** Optional viem PublicClient; a default Base client is created if omitted. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   publicClient?: any;
   /** cc0.company base URL for the launch registry. Override for self-hosted setups. */
   registryUrl?: string;
-}
-
-/** An unsigned launch transaction — sign + submit it with ANY wallet infra
- *  (Bankr submit, CDP, a Safe, raw eth_sendTransaction…). */
-export interface PreparedLaunchTransaction {
-  to: Address;
-  data: Hex;
-  value: bigint;
-  chainId: number;
 }
 
 // ─── ABIs (minimal fragments) ────────────────────────────────────────────────
@@ -282,19 +313,21 @@ export const FACTORY_ABI = [
  */
 export class Cc0Launchpad {
   public readonly walletClient?: WalletClient;
+  public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
   public readonly contracts = CC0_CONTRACTS.base;
   public readonly registryUrl: string;
 
   constructor(config: Cc0ClientConfig = {}) {
-    // Accept either a ready WalletClient or any viem Account (private key, CDP
-    // server wallet via toAccount, …) — a Base WalletClient is built internally.
+    // Accept a ready WalletClient, any viem Account (a Base WalletClient is built
+    // internally), or a provider-agnostic ExternalSender (CDP, Bankr, Safe, …).
     this.walletClient =
       config.walletClient ??
       (config.account
         ? createWalletClient({ account: config.account, chain: base, transport: http() })
         : undefined);
+    this.sender = config.sender;
     this.publicClient =
       config.publicClient ?? createPublicClient({ chain: base, transport: http() });
     this.registryUrl = (config.registryUrl ?? 'https://cc0.company').replace(/\/$/, '');
@@ -377,50 +410,81 @@ export class Cc0Launchpad {
     return (await this.pinImage(image)).ipfsUri;
   }
 
+  /**
+   * Launch end-to-end with whatever you configured:
+   *   • walletClient / account → signs + submits via viem
+   *   • sender (CDP, Bankr, Safe, relayer) → SDK prepares, your infra submits,
+   *     SDK waits / parses / registers
+   * Either way: image pinned to IPFS, gas handled, token page live on cc0.company.
+   */
   async launchToken(p: LaunchTokenParams): Promise<LaunchTokenResult> {
-    if (!this.walletClient) {
-      throw new Error(
-        'A walletClient (or account) is required to launch. For unsigned-calldata flows (Bankr submit, Safes, …) use prepareLaunchTransaction() instead.',
-      );
+    // ── Path 1: viem wallet ───────────────────────────────────────────────────
+    if (this.walletClient) {
+      const account = this.walletClient.account;
+      if (!account) throw new Error('walletClient has no account attached.');
+      const creator = account.address as Address;
+
+      const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(p, creator);
+
+      const txHash = await this.walletClient.writeContract({
+        account,
+        address: this.contracts.FACTORY,
+        abi: FACTORY_ABI,
+        functionName: 'deployToken',
+        args: [config as never],
+        chain: base,
+        value: totalMsgValue,
+      });
+
+      return this.finishLaunch({ txHash, params: p, creator, imageUri });
     }
-    const account = this.walletClient.account;
-    if (!account) throw new Error('walletClient has no account attached.');
-    const creator = account.address as Address;
 
-    const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(p, creator);
+    // ── Path 2: external sender (CDP, Bankr, Safe, any relayer) ───────────────
+    if (this.sender) {
+      const creator = this.sender.address;
+      const prepared = await this.prepareLaunchTransaction(p, { creator });
+      const txHash = await this.sender.send(prepared);
+      return this.finishLaunch({ txHash, params: p, creator, imageUri: prepared.imageUri });
+    }
 
-    const txHash = await this.walletClient.writeContract({
-      account,
-      address: this.contracts.FACTORY,
-      abi: FACTORY_ABI,
-      functionName: 'deployToken',
-      args: [config as never],
-      chain: base,
-      value: totalMsgValue,
-    });
+    throw new Error(
+      'No signer configured. Pass walletClient, account, or sender to the constructor — or use prepareLaunchTransaction() for fully manual flows.',
+    );
+  }
 
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+  /**
+   * Finish a launch whose transaction was submitted externally: waits for the
+   * receipt, extracts the token address, registers it on cc0.company. The
+   * `sender` path of launchToken calls this for you.
+   */
+  async finishLaunch(args: {
+    txHash: Hash;
+    params: Pick<LaunchTokenParams, 'name' | 'symbol' | 'description' | 'airdrop' | 'register'>;
+    creator: Address;
+    /** The resolved ipfs:// URI (from PreparedLaunchTransaction.imageUri). */
+    imageUri?: string;
+  }): Promise<LaunchTokenResult> {
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: args.txHash });
     const tokenAddress = parseLaunchReceipt(receipt);
-    if (!tokenAddress) throw new Error('Launch succeeded but TokenCreated event was not found.');
+    if (!tokenAddress) throw new Error('Transaction confirmed but TokenCreated event was not found.');
 
-    // ── Auto-register on cc0.company ──────────────────────────────────────────
-    // Gives the token its page (chart, swap, fee-claim button) + makes it
-    // searchable. Best-effort: a registry hiccup never fails an on-chain launch.
+    // Auto-register on cc0.company — token page (chart, swap, fee-claim button)
+    // + browse/search. Best-effort: a registry hiccup never fails the launch.
     let registered = false;
-    if (p.register !== false) {
+    if (args.params.register !== false) {
       registered = await this.registerLaunch({
         tokenAddress,
-        txHash,
-        name: p.name,
-        symbol: p.symbol,
-        description: p.description,
-        image: imageUri,
-        creator,
-        hasAirdrop: !!p.airdrop,
+        txHash: args.txHash,
+        name: args.params.name,
+        symbol: args.params.symbol,
+        description: args.params.description,
+        image: args.imageUri,
+        creator: args.creator,
+        hasAirdrop: !!args.params.airdrop,
       });
     }
 
-    return { tokenAddress, txHash, registered };
+    return { tokenAddress, txHash: args.txHash, registered };
   }
 
   /**
@@ -437,17 +501,32 @@ export class Cc0Launchpad {
     p: LaunchTokenParams,
     opts: { creator: Address },
   ): Promise<PreparedLaunchTransaction> {
-    const { config, totalMsgValue } = await this.buildDeploymentConfig(p, opts.creator);
-    return {
-      to: this.contracts.FACTORY,
-      data: encodeFunctionData({
-        abi: FACTORY_ABI,
-        functionName: 'deployToken',
-        args: [config as never],
-      }),
-      value: totalMsgValue,
-      chainId: base.id,
-    };
+    const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(p, opts.creator);
+    const to = this.contracts.FACTORY;
+    const data = encodeFunctionData({
+      abi: FACTORY_ABI,
+      functionName: 'deployToken',
+      args: [config as never],
+    });
+
+    // Estimate gas from the creator with a 20% buffer. deployToken is HEAVY
+    // (token + pool + locked LP + extensions ≈ 10-15M gas) — guessing low makes
+    // the tx revert, guessing blind wastes integrators' time. Falls back to a
+    // safe ceiling when the node refuses to estimate (e.g. unfunded creator).
+    let gas = BigInt(16_000_000);
+    try {
+      const estimated = (await this.publicClient.estimateGas({
+        account: opts.creator,
+        to,
+        data,
+        value: totalMsgValue,
+      })) as bigint;
+      gas = (estimated * BigInt(120)) / BigInt(100);
+    } catch {
+      /* keep the fallback ceiling */
+    }
+
+    return { ...toPreparedTx(to, data, totalMsgValue, gas), imageUri };
   }
 
   /**
@@ -769,6 +848,24 @@ export class Cc0Launchpad {
 
     return { config, totalMsgValue, imageUri };
   }
+}
+
+/** Build a PreparedTransaction (incl. the BigInt-free JSON mirror) for ExternalSender flows. */
+export function toPreparedTx(to: Address, data: Hex, value: bigint, gas: bigint): PreparedTransaction {
+  return {
+    to,
+    data,
+    value,
+    chainId: base.id,
+    gas,
+    json: {
+      to,
+      data,
+      value: `0x${value.toString(16)}` as Hex,
+      chainId: base.id,
+      gas: `0x${gas.toString(16)}` as Hex,
+    },
+  };
 }
 
 /** Best-effort image MIME detection from magic bytes (for raw Uint8Array inputs). */

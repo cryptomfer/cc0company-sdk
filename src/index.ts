@@ -9,12 +9,14 @@
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 // Launchpad
-export { Cc0Launchpad, FACTORY_ABI, parseLaunchReceipt } from './launchpad';
+export { Cc0Launchpad, FACTORY_ABI, parseLaunchReceipt, toPreparedTx } from './launchpad';
 export type {
   Cc0ClientConfig,
+  ExternalSender,
   LaunchTokenParams,
   LaunchTokenResult,
   LaunchImage,
+  PreparedTransaction,
   PreparedLaunchTransaction,
   CreatorRewardSlice,
   CreatorFeePreference,
