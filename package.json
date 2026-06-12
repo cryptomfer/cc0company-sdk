@@ -1,6 +1,6 @@
 {
   "name": "@cc0company/sdk",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Official SDK for cc0.company — launch tokens on the launchpad (75/15/10 enforced on-chain), claim creator fees, and stake $cc0company. Built for humans & AI agents.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

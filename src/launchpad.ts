@@ -145,8 +145,19 @@ export interface PreparedTransaction {
   chainId: number;
   /** Estimated gas limit with a 20% buffer (deployToken is heavy: ~10-15M). */
   gas: bigint;
-  /** JSON-safe mirror: { to, data, value: '0x…', chainId, gas: '0x…' }. */
-  json: { to: Address; data: Hex; value: Hex; chainId: number; gas: Hex };
+  /** Current EIP-1559 fees from the chain (some transports — CDP — require them). */
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
+  /** JSON-safe (BigInt-free, hex) mirror of the whole transaction. */
+  json: {
+    to: Address;
+    data: Hex;
+    value: Hex;
+    chainId: number;
+    gas: Hex;
+    maxFeePerGas?: Hex;
+    maxPriorityFeePerGas?: Hex;
+  };
 }
 
 /** A prepared launch — also carries the resolved on-chain image URI. */
@@ -444,6 +455,9 @@ export class Cc0Launchpad {
       const creator = this.sender.address;
       const prepared = await this.prepareLaunchTransaction(p, { creator });
       const txHash = await this.sender.send(prepared);
+      // Fail fast on a bad hash instead of waiting forever for a receipt that
+      // will never arrive (e.g. reading `.hash` when CDP returns `.transactionHash`).
+      assertTxHash(txHash, 'Your sender.send()');
       return this.finishLaunch({ txHash, params: p, creator, imageUri: prepared.imageUri });
     }
 
@@ -464,7 +478,13 @@ export class Cc0Launchpad {
     /** The resolved ipfs:// URI (from PreparedLaunchTransaction.imageUri). */
     imageUri?: string;
   }): Promise<LaunchTokenResult> {
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash: args.txHash });
+    assertTxHash(args.txHash, 'finishLaunch');
+    // Bounded wait — surface a clear error instead of hanging forever on a
+    // dropped/never-mined transaction.
+    const receipt = await this.publicClient.waitForTransactionReceipt({
+      hash: args.txHash,
+      timeout: 180_000,
+    });
     const tokenAddress = parseLaunchReceipt(receipt);
     if (!tokenAddress) throw new Error('Transaction confirmed but TokenCreated event was not found.');
 
@@ -510,7 +530,7 @@ export class Cc0Launchpad {
     });
 
     // Estimate gas from the creator with a 20% buffer. deployToken is HEAVY
-    // (token + pool + locked LP + extensions ≈ 10-15M gas) — guessing low makes
+    // (token + pool + locked LP + extensions ≈ 4-15M gas) — guessing low makes
     // the tx revert, guessing blind wastes integrators' time. Falls back to a
     // safe ceiling when the node refuses to estimate (e.g. unfunded creator).
     let gas = BigInt(16_000_000);
@@ -526,7 +546,11 @@ export class Cc0Launchpad {
       /* keep the fallback ceiling */
     }
 
-    return { ...toPreparedTx(to, data, totalMsgValue, gas), imageUri };
+    // EIP-1559 fees from the chain — transports like CDP reject an unsigned tx
+    // without them ("Malformed unsigned EIP-1559 transaction").
+    const fees = await estimateEip1559Fees(this.publicClient);
+
+    return { ...toPreparedTx(to, data, totalMsgValue, gas, fees), imageUri };
   }
 
   /**
@@ -851,21 +875,63 @@ export class Cc0Launchpad {
 }
 
 /** Build a PreparedTransaction (incl. the BigInt-free JSON mirror) for ExternalSender flows. */
-export function toPreparedTx(to: Address, data: Hex, value: bigint, gas: bigint): PreparedTransaction {
+export function toPreparedTx(
+  to: Address,
+  data: Hex,
+  value: bigint,
+  gas: bigint,
+  fees?: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint },
+): PreparedTransaction {
   return {
     to,
     data,
     value,
     chainId: base.id,
     gas,
+    maxFeePerGas: fees?.maxFeePerGas,
+    maxPriorityFeePerGas: fees?.maxPriorityFeePerGas,
     json: {
       to,
       data,
       value: `0x${value.toString(16)}` as Hex,
       chainId: base.id,
       gas: `0x${gas.toString(16)}` as Hex,
+      ...(fees
+        ? {
+            maxFeePerGas: `0x${fees.maxFeePerGas.toString(16)}` as Hex,
+            maxPriorityFeePerGas: `0x${fees.maxPriorityFeePerGas.toString(16)}` as Hex,
+          }
+        : {}),
     },
   };
+}
+
+/** Current EIP-1559 fees from the chain, best-effort (undefined when the node won't say). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function estimateEip1559Fees(
+  publicClient: any,
+): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | undefined> {
+  try {
+    const f = await publicClient.estimateFeesPerGas();
+    if (f?.maxFeePerGas && f?.maxPriorityFeePerGas) {
+      return { maxFeePerGas: f.maxFeePerGas as bigint, maxPriorityFeePerGas: f.maxPriorityFeePerGas as bigint };
+    }
+  } catch {
+    /* fall through */
+  }
+  return undefined;
+}
+
+/** Reject non-hashes EARLY with an actionable message instead of hanging on a
+ *  receipt that will never arrive (the classic: reading `.hash` when your
+ *  provider returns `{ transactionHash }` — CDP does). */
+export function assertTxHash(hash: unknown, context: string): asserts hash is Hash {
+  if (typeof hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+    throw new Error(
+      `${context} returned an invalid transaction hash (got: ${String(hash)}). ` +
+        `Check which field your provider returns — Coinbase CDP returns { transactionHash }, not { hash }.`,
+    );
+  }
 }
 
 /** Best-effort image MIME detection from magic bytes (for raw Uint8Array inputs). */

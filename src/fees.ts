@@ -11,7 +11,7 @@ import {
 import { base } from 'viem/chains';
 
 import { CC0_CONTRACTS } from './addresses';
-import { toPreparedTx } from './launchpad';
+import { assertTxHash, estimateEip1559Fees, toPreparedTx } from './launchpad';
 import type { Cc0ClientConfig, ExternalSender } from './launchpad';
 
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -156,12 +156,14 @@ export class Cc0Fees {
         })) as bigint;
         gas = (estimated * BigInt(120)) / BigInt(100);
       } catch { /* keep fallback */ }
-      hash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas));
+      const fees = await estimateEip1559Fees(this.publicClient);
+      hash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas, fees));
+      assertTxHash(hash, 'Your sender.send()');
     } else {
       throw new Error('A walletClient, account, or sender is required to claim.');
     }
 
-    await this.publicClient.waitForTransactionReceipt({ hash });
+    await this.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
     return hash;
   }
 }

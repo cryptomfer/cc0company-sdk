@@ -9,7 +9,14 @@
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 // Launchpad
-export { Cc0Launchpad, FACTORY_ABI, parseLaunchReceipt, toPreparedTx } from './launchpad';
+export {
+  Cc0Launchpad,
+  FACTORY_ABI,
+  parseLaunchReceipt,
+  toPreparedTx,
+  estimateEip1559Fees,
+  assertTxHash,
+} from './launchpad';
 export type {
   Cc0ClientConfig,
   ExternalSender,
