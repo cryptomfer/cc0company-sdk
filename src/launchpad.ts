@@ -94,13 +94,27 @@ export interface LaunchTokenParams {
   socials?: string[];
   /** 'static' (1/2/3% tier) or 'dynamic' (1%→3% volatility preset). Default 'static'. */
   feeMode?: 'static' | 'dynamic';
-  /** Static LP fee tier in percent. Default 1. Ignored when feeMode === 'dynamic'. */
-  feeTier?: 1 | 2 | 3;
+  /** Static LP fee tier in percent: 1, 2, 3, or 6.9. Default 1. Ignored when feeMode === 'dynamic'. */
+  feeTier?: 1 | 2 | 3 | 6.9;
   /**
    * How to split the creator's 75%. Defaults to a single slice to the deployer.
-   * Up to 5 slices; bps must sum to exactly 7500.
+   * Up to 5 slices; bps must sum to exactly 7500. Overridden by `nftCollection` (Option B).
    */
   creatorRewards?: CreatorRewardSlice[];
+  /**
+   * Option B — route the FULL 75% creator slice to the holders of this NFT collection. The SDK
+   * deploys a per-token Cc0NftFeeDistributor (an extra tx via your signer) and wires it as the sole
+   * creator recipient with feePreference 'both' (holders earn WETH + the launched token); the slice
+   * is frozen to the distributor. Overrides `creatorRewards`. Requires a walletClient/account or
+   * sender — the manual prepareLaunchTransaction() path can't auto-deploy, so there deploy via
+   * deployNftDistributor() yourself and pass the address as a creatorRewards recipient.
+   */
+  nftCollection?: {
+    /** ERC-721 collection on Base (sequential ids; exposes totalSupply()). */
+    address: Address;
+    /** Highest existing tokenId at launch — the eligibility ceiling (excludes post-launch mints). */
+    maxEligibleTokenId: bigint | number;
+  };
   /** Optional sniper tax (descending fee). Without it, a 2-block MEV delay applies. */
   sniperTax?: { startingBps: number; endingBps: number; secondsToDecay: number };
   /** Optional creator supply vault (% of supply, lockup ≥ 7 days, optional vesting). */
@@ -305,6 +319,31 @@ export const FACTORY_ABI = [
   },
 ] as const;
 
+/** NFT fee-distributor factory (Option B): deploy a per-token distributor, read its address. */
+export const NFT_FACTORY_ABI = [
+  {
+    type: 'function',
+    name: 'createDistributor',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'collection', type: 'address' },
+      { name: 'maxEligibleTokenId', type: 'uint256' },
+    ],
+    outputs: [{ name: 'distributor', type: 'address' }],
+  },
+  {
+    type: 'event',
+    name: 'DistributorCreated',
+    inputs: [
+      { name: 'collection', type: 'address', indexed: true },
+      { name: 'distributor', type: 'address', indexed: true },
+      { name: 'creator', type: 'address', indexed: true },
+      { name: 'maxEligibleTokenId', type: 'uint256', indexed: false },
+      { name: 'supply', type: 'uint256', indexed: false },
+    ],
+  },
+] as const;
+
 // ─── Launchpad ───────────────────────────────────────────────────────────────
 
 /**
@@ -429,13 +468,32 @@ export class Cc0Launchpad {
    * Either way: image pinned to IPFS, gas handled, token page live on cc0.company.
    */
   async launchToken(p: LaunchTokenParams): Promise<LaunchTokenResult> {
+    // Option B — deploy a per-token NFT fee distributor (extra tx via the configured signer) and
+    // route the FULL 75% to it as the sole creator slice (feePreference 'both' → holders earn WETH
+    // + the launched token; admin = the distributor → the slice is frozen, trustless).
+    let effective = p;
+    let nftDistributor: Address | undefined;
+    if (p.nftCollection) {
+      nftDistributor = await this.deployNftDistributor(
+        p.nftCollection.address,
+        p.nftCollection.maxEligibleTokenId,
+      );
+      effective = {
+        ...p,
+        creatorRewards: [
+          { recipient: nftDistributor, bps: PROTOCOL_SPLIT.CREATOR_BPS, feePreference: 'both' },
+        ],
+      };
+    }
+    const nftCollectionAddr = p.nftCollection?.address;
+
     // ── Path 1: viem wallet ───────────────────────────────────────────────────
     if (this.walletClient) {
       const account = this.walletClient.account;
       if (!account) throw new Error('walletClient has no account attached.');
       const creator = account.address as Address;
 
-      const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(p, creator);
+      const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(effective, creator);
 
       const txHash = await this.walletClient.writeContract({
         account,
@@ -447,23 +505,105 @@ export class Cc0Launchpad {
         value: totalMsgValue,
       });
 
-      return this.finishLaunch({ txHash, params: p, creator, imageUri });
+      return this.finishLaunch({
+        txHash,
+        params: p,
+        creator,
+        imageUri,
+        nftDistributor,
+        nftCollection: nftCollectionAddr,
+      });
     }
 
     // ── Path 2: external sender (CDP, Bankr, Safe, any relayer) ───────────────
     if (this.sender) {
       const creator = this.sender.address;
-      const prepared = await this.prepareLaunchTransaction(p, { creator });
+      const prepared = await this.prepareLaunchTransaction(effective, { creator });
       const txHash = await this.sender.send(prepared);
       // Fail fast on a bad hash instead of waiting forever for a receipt that
       // will never arrive (e.g. reading `.hash` when CDP returns `.transactionHash`).
       assertTxHash(txHash, 'Your sender.send()');
-      return this.finishLaunch({ txHash, params: p, creator, imageUri: prepared.imageUri });
+      return this.finishLaunch({
+        txHash,
+        params: p,
+        creator,
+        imageUri: prepared.imageUri,
+        nftDistributor,
+        nftCollection: nftCollectionAddr,
+      });
     }
 
     throw new Error(
       'No signer configured. Pass walletClient, account, or sender to the constructor — or use prepareLaunchTransaction() for fully manual flows.',
     );
+  }
+
+  /**
+   * Deploy a per-token {Cc0NftFeeDistributor} for `collection` via the factory and return its
+   * address (parsed from the DistributorCreated event). Works through walletClient/account or a
+   * sender. `launchToken({ nftCollection })` calls this for you; call it directly for the manual
+   * prepareLaunchTransaction flow, then pass the returned address as a creatorRewards recipient.
+   */
+  async deployNftDistributor(
+    collection: Address,
+    maxEligibleTokenId: bigint | number,
+  ): Promise<Address> {
+    const to = this.contracts.NFT_FEE_FACTORY;
+    const args = [collection, BigInt(maxEligibleTokenId)] as const;
+    let txHash: Hash;
+
+    if (this.walletClient) {
+      const account = this.walletClient.account;
+      if (!account) throw new Error('walletClient has no account attached.');
+      txHash = await this.walletClient.writeContract({
+        account,
+        address: to,
+        abi: NFT_FACTORY_ABI,
+        functionName: 'createDistributor',
+        args: args as never,
+        chain: base,
+      });
+    } else if (this.sender) {
+      const data = encodeFunctionData({
+        abi: NFT_FACTORY_ABI,
+        functionName: 'createDistributor',
+        args: args as never,
+      });
+      let gas = BigInt(2_500_000);
+      try {
+        const est = (await this.publicClient.estimateGas({
+          account: this.sender.address,
+          to,
+          data,
+        })) as bigint;
+        gas = (est * BigInt(120)) / BigInt(100);
+      } catch {
+        /* keep the fallback ceiling */
+      }
+      const fees = await estimateEip1559Fees(this.publicClient);
+      txHash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas, fees));
+      assertTxHash(txHash, 'Your sender.send()');
+    } else {
+      throw new Error(
+        'No signer configured to deploy the NFT fee distributor — pass walletClient, account, or sender.',
+      );
+    }
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({
+      hash: txHash,
+      timeout: 180_000,
+    });
+    const logs = parseEventLogs({
+      abi: NFT_FACTORY_ABI,
+      eventName: 'DistributorCreated',
+      logs: receipt.logs,
+    });
+    const distributor = (logs[0] as unknown as { args?: { distributor?: Address } })?.args
+      ?.distributor;
+    if (!distributor) {
+      throw new Error('Distributor deploy confirmed but DistributorCreated event was not found.');
+    }
+    return distributor;
   }
 
   /**
@@ -477,6 +617,10 @@ export class Cc0Launchpad {
     creator: Address;
     /** The resolved ipfs:// URI (from PreparedLaunchTransaction.imageUri). */
     imageUri?: string;
+    /** Option B: the deployed per-token NFT fee distributor + its linked collection, recorded so
+     *  the token page / NFT-detail / /rewards surfaces can find it. */
+    nftDistributor?: Address;
+    nftCollection?: Address;
   }): Promise<LaunchTokenResult> {
     assertTxHash(args.txHash, 'finishLaunch');
     // Bounded wait — surface a clear error instead of hanging forever on a
@@ -501,6 +645,8 @@ export class Cc0Launchpad {
         image: args.imageUri,
         creator: args.creator,
         hasAirdrop: !!args.params.airdrop,
+        nftFeeDistributor: args.nftDistributor,
+        nftFeeCollection: args.nftCollection,
       });
     }
 
@@ -567,6 +713,9 @@ export class Cc0Launchpad {
     image?: string;
     creator: Address;
     hasAirdrop?: boolean;
+    /** Option B: the per-token NFT fee distributor + the collection whose holders earn. */
+    nftFeeDistributor?: Address;
+    nftFeeCollection?: Address;
   }): Promise<boolean> {
     try {
       const res = await fetch(`${this.registryUrl}/api/store/token-launches`, {
@@ -583,6 +732,13 @@ export class Cc0Launchpad {
           image_url: params.image || undefined,
           creator_wallet: params.creator,
           has_airdrop: !!params.hasAirdrop,
+          ...(params.nftFeeDistributor && params.nftFeeCollection
+            ? {
+                nft_fee_distributor: params.nftFeeDistributor,
+                nft_fee_collection: params.nftFeeCollection,
+                nft_fee_collection_chain: 'base',
+              }
+            : {}),
         }),
         signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
       });
@@ -671,7 +827,8 @@ export class Cc0Launchpad {
       );
     } else {
       hook = c.HOOK_STATIC_FEE;
-      const feeUnits = (p.feeTier ?? 1) * 10_000;
+      // 1e6 units: 1/2/3/6.9% -> 10000/20000/30000/69000. Round (6.9*10000 isn't exact in float).
+      const feeUnits = Math.round((p.feeTier ?? 1) * 10_000);
       feeData = encodeAbiParameters(
         [{ name: 'clankerFee', type: 'uint24' }, { name: 'pairedFee', type: 'uint24' }],
         [feeUnits, feeUnits],

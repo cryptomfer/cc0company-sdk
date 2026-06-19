@@ -24,6 +24,10 @@ export const CC0_CONTRACTS = {
     AIRDROP_V2: '0x8f6f4612CDdcFE0454aA3c448cb05bFCA5479994' as Address,
     DEV_BUY_V4: '0xA9AF8A07FdeB2775646ad5071bAF14CA3749FfC5' as Address,
     WETH: '0x4200000000000000000000000000000000000006' as Address,
+    /** NFT-holder fee distribution (Option B): factory deploys a per-token distributor; */
+    /** router claims a holder's rewards across many distributors in one tx. */
+    NFT_FEE_FACTORY: '0x7867f16Cf2abF38C592b7b4f4807AC28B284a727' as Address,
+    NFT_REWARDS_ROUTER: '0x49E2386CdBEC0030C792c0943A59baCE293c1e2a' as Address,
   },
 } as const;
 
