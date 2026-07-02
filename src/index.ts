@@ -37,10 +37,16 @@ export type { ClaimableFees, ClaimFeesResult } from './fees';
 export { Cc0Staking } from './staking';
 export type { StakingPosition } from './staking';
 
-// Addresses + protocol constants
+// Addresses + protocol constants + chains (Base 8453 · Ethereum 1 · Robinhood Chain 4663)
 export {
   CC0_CONTRACTS,
+  CHAIN_IDS,
+  DEFAULT_RPCS,
   PROTOCOL_SPLIT,
+  robinhoodChain,
+  toChainSlug,
   VAULT_MIN_LOCKUP_SECONDS,
   AIRDROP_MIN_LOCKUP_SECONDS,
+  VIEM_CHAINS,
 } from './addresses';
+export type { Cc0Chain, Cc0ChainSlug } from './addresses';

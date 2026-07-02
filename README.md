@@ -3,11 +3,18 @@
 The official [cc0.company](https://cc0.company) SDK. Launch tokens on the launchpad,
 claim creator fees, and stake $cc0company — from any website, app, or AI agent.
 
-- **`Cc0Launchpad`** — deploy a token on Base in one transaction, with the on-chain
-  enforced **75/15/10** fee split: 75% of every trade's LP fee to you, 15% to
-  $cc0company stakers, 10% to the platform.
-- **`Cc0Fees`** — read and claim your accrued trading fees (WETH + your token).
-- **`Cc0Staking`** — stake $cc0company and earn WETH from every launch.
+- **`Cc0Launchpad`** — deploy a token on **Base, Ethereum, or Robinhood Chain** in one
+  transaction, with the on-chain enforced **75/15/10** fee split: 75% of every trade's
+  LP fee to you, 15% to $cc0company stakers, 10% to the platform.
+- **`Cc0Fees`** — read and claim your accrued trading fees (WETH + your token), on the
+  chain you launched on.
+- **`Cc0Staking`** — stake $cc0company (on Base) and earn WETH from every launch on
+  every chain — the Ethereum and Robinhood Chain staking slices bridge to the Base pool.
+
+```ts
+// Pick the chain at construction — 'base' (default) | 'ethereum' | 'robinhood':
+const launchpad = new Cc0Launchpad({ account, chain: 'robinhood' });
+```
 
 One peer dependency: [viem](https://viem.sh).
 

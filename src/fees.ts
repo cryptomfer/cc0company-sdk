@@ -8,9 +8,14 @@ import {
   type Hex,
   type WalletClient,
 } from 'viem';
-import { base } from 'viem/chains';
-
-import { CC0_CONTRACTS } from './addresses';
+import {
+  CC0_CONTRACTS,
+  CHAIN_IDS,
+  DEFAULT_RPCS,
+  toChainSlug,
+  VIEM_CHAINS,
+  type Cc0ChainSlug,
+} from './addresses';
 import { assertTxHash, estimateEip1559Fees, toPreparedTx } from './launchpad';
 import type { Cc0ClientConfig, ExternalSender } from './launchpad';
 
@@ -78,17 +83,32 @@ export class Cc0Fees {
   public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
-  public readonly contracts = CC0_CONTRACTS.base;
+  /** Chain this instance reads/claims on ('base' default | 'ethereum' | 'robinhood'). */
+  public readonly chainSlug: Cc0ChainSlug;
+  public readonly chainId: number;
+  public readonly chain: (typeof VIEM_CHAINS)[Cc0ChainSlug];
+  public readonly contracts: (typeof CC0_CONTRACTS)[Cc0ChainSlug];
 
   constructor(config: Cc0ClientConfig = {}) {
+    // Fees accrue on the chain the token LAUNCHED on — pass the same `chain` you launched with.
+    this.chainSlug = toChainSlug(config.chain);
+    this.chainId = CHAIN_IDS[this.chainSlug];
+    this.chain = VIEM_CHAINS[this.chainSlug];
+    this.contracts = CC0_CONTRACTS[this.chainSlug];
+
     this.walletClient =
       config.walletClient ??
       (config.account
-        ? createWalletClient({ account: config.account, chain: base, transport: http() })
+        ? createWalletClient({
+            account: config.account,
+            chain: this.chain,
+            transport: http(DEFAULT_RPCS[this.chainSlug]),
+          })
         : undefined);
     this.sender = config.sender;
     this.publicClient =
-      config.publicClient ?? createPublicClient({ chain: base, transport: http() });
+      config.publicClient ??
+      createPublicClient({ chain: this.chain, transport: http(DEFAULT_RPCS[this.chainSlug]) });
   }
 
   /** Claimable fees for `feeOwner` on `token` — WETH and the token itself. */
@@ -144,7 +164,7 @@ export class Cc0Fees {
         account: this.walletClient.account,
         to,
         data,
-        chain: base,
+        chain: this.chain,
       });
     } else if (this.sender) {
       let gas = BigInt(400_000); // claims are cheap; generous fallback
@@ -157,7 +177,7 @@ export class Cc0Fees {
         gas = (estimated * BigInt(120)) / BigInt(100);
       } catch { /* keep fallback */ }
       const fees = await estimateEip1559Fees(this.publicClient);
-      hash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas, fees));
+      hash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas, fees, this.chainId));
       assertTxHash(hash, 'Your sender.send()');
     } else {
       throw new Error('A walletClient, account, or sender is required to claim.');

@@ -18,8 +18,14 @@ import { base } from 'viem/chains';
 import {
   AIRDROP_MIN_LOCKUP_SECONDS,
   CC0_CONTRACTS,
+  CHAIN_IDS,
+  DEFAULT_RPCS,
   PROTOCOL_SPLIT,
+  toChainSlug,
   VAULT_MIN_LOCKUP_SECONDS,
+  VIEM_CHAINS,
+  type Cc0Chain,
+  type Cc0ChainSlug,
 } from './addresses';
 
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -194,12 +200,19 @@ export interface ExternalSender {
 }
 
 export interface Cc0ClientConfig {
-  /** Viem WalletClient with an account (wagmi compatible). Base only for now. */
+  /**
+   * Chain to operate on: 'base' (default) | 'ethereum' | 'robinhood' — or the
+   * chain id (8453 | 1 | 4663). Drives the contract addresses, the default
+   * clients' network, the tx `chainId`, and the registry record. Your
+   * walletClient/publicClient (if provided) must be on the SAME chain.
+   */
+  chain?: Cc0Chain;
+  /** Viem WalletClient with an account (wagmi compatible), on the configured chain. */
   walletClient?: WalletClient;
   /**
-   * Alternative to `walletClient`: any viem Account — a WalletClient on Base is
-   * built internally. Works with `privateKeyToAccount(...)` and any provider
-   * that exposes a viem-compatible account.
+   * Alternative to `walletClient`: any viem Account — a WalletClient on the
+   * configured chain is built internally. Works with `privateKeyToAccount(...)`
+   * and any provider that exposes a viem-compatible account.
    */
   account?: Account;
   /**
@@ -208,7 +221,7 @@ export interface Cc0ClientConfig {
    * it, the SDK waits/parses/registers. See ExternalSender.
    */
   sender?: ExternalSender;
-  /** Optional viem PublicClient; a default Base client is created if omitted. */
+  /** Optional viem PublicClient; a default client on the configured chain is created if omitted. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   publicClient?: any;
   /** cc0.company base URL for the launch registry. Override for self-hosted setups. */
@@ -366,20 +379,39 @@ export class Cc0Launchpad {
   public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
-  public readonly contracts = CC0_CONTRACTS.base;
+  /** Canonical chain slug ('base' | 'ethereum' | 'robinhood') this instance targets. */
+  public readonly chainSlug: Cc0ChainSlug;
+  /** Numeric chain id (8453 | 1 | 4663). */
+  public readonly chainId: number;
+  /** viem Chain object for the configured chain (used on every signed tx). */
+  public readonly chain: (typeof VIEM_CHAINS)[Cc0ChainSlug];
+  public readonly contracts: (typeof CC0_CONTRACTS)[Cc0ChainSlug];
   public readonly registryUrl: string;
 
   constructor(config: Cc0ClientConfig = {}) {
-    // Accept a ready WalletClient, any viem Account (a Base WalletClient is built
-    // internally), or a provider-agnostic ExternalSender (CDP, Bankr, Safe, …).
+    // Per-chain wiring: 'base' (default) | 'ethereum' | 'robinhood'. Same factory
+    // semantics + enforced split on all three; only addresses/network differ.
+    this.chainSlug = toChainSlug(config.chain);
+    this.chainId = CHAIN_IDS[this.chainSlug];
+    this.chain = VIEM_CHAINS[this.chainSlug];
+    this.contracts = CC0_CONTRACTS[this.chainSlug];
+
+    // Accept a ready WalletClient, any viem Account (a WalletClient on the configured
+    // chain is built internally), or a provider-agnostic ExternalSender (CDP, Bankr, Safe, …).
+    // Explicit RPC URLs: viem's default Ethereum RPC is CORS-blocked in browsers.
     this.walletClient =
       config.walletClient ??
       (config.account
-        ? createWalletClient({ account: config.account, chain: base, transport: http() })
+        ? createWalletClient({
+            account: config.account,
+            chain: this.chain,
+            transport: http(DEFAULT_RPCS[this.chainSlug]),
+          })
         : undefined);
     this.sender = config.sender;
     this.publicClient =
-      config.publicClient ?? createPublicClient({ chain: base, transport: http() });
+      config.publicClient ??
+      createPublicClient({ chain: this.chain, transport: http(DEFAULT_RPCS[this.chainSlug]) });
     this.registryUrl = (config.registryUrl ?? 'https://cc0.company').replace(/\/$/, '');
   }
 
@@ -501,7 +533,7 @@ export class Cc0Launchpad {
         abi: FACTORY_ABI,
         functionName: 'deployToken',
         args: [config as never],
-        chain: base,
+        chain: this.chain,
         value: totalMsgValue,
       });
 
@@ -561,7 +593,7 @@ export class Cc0Launchpad {
         abi: NFT_FACTORY_ABI,
         functionName: 'createDistributor',
         args: args as never,
-        chain: base,
+        chain: this.chain,
       });
     } else if (this.sender) {
       const data = encodeFunctionData({
@@ -581,7 +613,7 @@ export class Cc0Launchpad {
         /* keep the fallback ceiling */
       }
       const fees = await estimateEip1559Fees(this.publicClient);
-      txHash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas, fees));
+      txHash = await this.sender.send(toPreparedTx(to, data, BigInt(0), gas, fees, this.chainId));
       assertTxHash(txHash, 'Your sender.send()');
     } else {
       throw new Error(
@@ -696,7 +728,7 @@ export class Cc0Launchpad {
     // without them ("Malformed unsigned EIP-1559 transaction").
     const fees = await estimateEip1559Fees(this.publicClient);
 
-    return { ...toPreparedTx(to, data, totalMsgValue, gas, fees), imageUri };
+    return { ...toPreparedTx(to, data, totalMsgValue, gas, fees, this.chainId), imageUri };
   }
 
   /**
@@ -723,7 +755,7 @@ export class Cc0Launchpad {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           token_address: params.tokenAddress,
-          chain: 'base',
+          chain: this.chainSlug,
           tx_hash: params.txHash,
           protocol: 'cc0strategy',
           name: params.name,
@@ -736,7 +768,7 @@ export class Cc0Launchpad {
             ? {
                 nft_fee_distributor: params.nftFeeDistributor,
                 nft_fee_collection: params.nftFeeCollection,
-                nft_fee_collection_chain: 'base',
+                nft_fee_collection_chain: this.chainSlug,
               }
             : {}),
         }),
@@ -1004,7 +1036,7 @@ export class Cc0Launchpad {
         image: imageUri,
         metadata: JSON.stringify({ description: p.description ?? '', socials: p.socials ?? [] }),
         context: 'cc0company-sdk',
-        originatingChainId: BigInt(8453),
+        originatingChainId: BigInt(this.chainId),
       },
       poolConfig: {
         hook,
@@ -1031,19 +1063,21 @@ export class Cc0Launchpad {
   }
 }
 
-/** Build a PreparedTransaction (incl. the BigInt-free JSON mirror) for ExternalSender flows. */
+/** Build a PreparedTransaction (incl. the BigInt-free JSON mirror) for ExternalSender flows.
+ *  `chainId` defaults to Base for back-compat — chain-aware callers pass their own. */
 export function toPreparedTx(
   to: Address,
   data: Hex,
   value: bigint,
   gas: bigint,
   fees?: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint },
+  chainId: number = base.id,
 ): PreparedTransaction {
   return {
     to,
     data,
     value,
-    chainId: base.id,
+    chainId,
     gas,
     maxFeePerGas: fees?.maxFeePerGas,
     maxPriorityFeePerGas: fees?.maxPriorityFeePerGas,
@@ -1051,7 +1085,7 @@ export function toPreparedTx(
       to,
       data,
       value: `0x${value.toString(16)}` as Hex,
-      chainId: base.id,
+      chainId,
       gas: `0x${gas.toString(16)}` as Hex,
       ...(fees
         ? {
