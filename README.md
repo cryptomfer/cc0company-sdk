@@ -10,6 +10,10 @@ claim creator fees, and stake $cc0company — from any website, app, or AI agent
   chain you launched on.
 - **`Cc0Staking`** — stake $cc0company (on Base) and earn WETH from every launch on
   every chain — the Ethereum and Robinhood Chain staking slices bridge to the Base pool.
+- **`Cc0Drops`** — the full IPFS NFT drop lifecycle (CC0Drop ERC721-C + CC0Drop1155):
+  pin art + metadata, deploy in one signature, record on cc0.company, then manage the
+  drop exactly like the dashboard — phases, allowlists (merkle), royalties, airdrops,
+  open-edition numbering, NEW editions on a live 1155, withdraw, seal — and mint.
 
 ```ts
 // Pick the chain at construction — 'base' (default) | 'ethereum' | 'robinhood':
@@ -26,7 +30,7 @@ npm install @cc0company/sdk viem
 
 ## Wallets — what the SDK accepts
 
-Every client (`Cc0Launchpad`, `Cc0Fees`, `Cc0Staking`) takes ONE of three signers:
+Every client (`Cc0Launchpad`, `Cc0Fees`, `Cc0Staking`, `Cc0Drops`) takes ONE of three signers:
 
 ```typescript
 // 1. Browser wallet (MetaMask, Rabby, …) — viem walletClient
@@ -241,6 +245,59 @@ await staking.requestUnstake(parseEther('500')); // starts the 48h cooldown
 await staking.withdraw();                        // after the cooldown
 await staking.exit();                            // claim all + unstake all, one tx
 ```
+
+## NFT drops — deploy, manage, mint (IPFS)
+
+The full CC0Drop (ERC721-C) / CC0Drop1155 lifecycle. Deploys need a
+`walletClient`/`account` (raw contract creation); everything else — management,
+minting, pinning — works with ANY signer, including a Bankr `sender` that
+provides `signMessage` (validated via EIP-1271 server-side).
+
+```typescript
+import { Cc0Drops } from '@cc0company/sdk';
+
+const drops = new Cc0Drops({ walletClient }); // or { account } / { sender }
+
+// 1. Pin art + metadata
+const art  = await drops.pinArt(pngBytes, 'art.png');
+const meta = await drops.pinDropMetadata({ name: 'My Drop', image: art.ipfsUri });
+
+// 2. Deploy (one signature) — recorded on cc0.company automatically
+const { contractAddress } = await drops.deployDrop721({
+  name: 'My Drop', symbol: 'DROP',
+  baseURI: meta.baseURI, contractURI: meta.contractURI,
+  maxSupply: 1000,                       // 0 = open edition
+  publicPhase: { priceEth: '0.001' },
+  allowlist: { entries: [{ address: '0x…', quantity: 2 }], priceEth: '0' },
+});
+
+// 3. Manage — full dashboard parity
+await drops.setPublicPhase721(contractAddress, { priceEth: '0.002' });
+await drops.setAllowlist721(contractAddress, entries);        // root + phase + preimage
+await drops.enableOpenEditionNumbering(contractAddress);      // "Name #1, #2…"
+await drops.ownerMint721(contractAddress, 10, '0xFriend…');  // airdrop
+await drops.withdraw(contractAddress);
+await drops.sealContract(contractAddress);                    // PERMANENT freeze
+
+// 4. Multi-edition 1155 — including NEW editions on a LIVE collection
+const d1155 = await drops.deployDrop1155({
+  name: 'Editions', symbol: 'ED', baseURI: meta1155.baseURI,
+  firstEdition: { maxSupply: 100, publicPhase: { priceEth: '0.001' } },
+});
+await drops.addEdition1155(d1155.contractAddress,
+  { tokenId: 2, maxSupply: 0 },          // 0 = open edition
+  { name: 'Editions', editions: [ed1Meta, ed2Meta] }, // folder covers ALL ids
+);
+
+// 5. Mint (buyer side — any signer)
+await drops.mint721(contractAddress, 1);
+await drops.mintAllowlist721(contractAddress, 1, { entries }); // proof built locally
+```
+
+Signer-only integrations (Bankr): `drops.resolveAgent()` fetches your agent
+identity + profile from the wallet address alone, and the authed routes (pin)
+sign the `cc0.company:agent-auth` message via `sender.signMessage`. Legacy
+`agentApiKey` remains a fallback credential.
 
 ## Your token on cc0.company — automatic
 

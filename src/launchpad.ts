@@ -197,6 +197,15 @@ export interface ExternalSender {
   address: Address;
   /** Submit the transaction, return its hash. Use `tx.json` for JSON transports. */
   send: (tx: PreparedTransaction) => Promise<Hash>;
+  /**
+   * OPTIONAL: sign an EIP-191 personal message and return the signature.
+   * Enables the agent-auth'd HTTP routes (art pinning, drop records) for
+   * signer-only integrations — Bankr smart wallets validate via EIP-1271,
+   * so the returned signature does not need to be an EOA recover match.
+   * Without it, Cc0Drops falls back to `agentApiKey` (legacy) for those
+   * routes; all purely on-chain methods work regardless.
+   */
+  signMessage?: (message: string) => Promise<Hex>;
 }
 
 export interface Cc0ClientConfig {

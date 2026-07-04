@@ -4,6 +4,7 @@
 //   • Cc0Launchpad — launch tokens with the on-chain enforced 75/15/10 fee split
 //   • Cc0Fees      — read + claim creator trading fees
 //   • Cc0Staking   — stake $cc0company, earn WETH from every launch
+//   • Cc0Drops     — deploy, manage + mint IPFS NFT drops (CC0Drop 721 / 1155)
 //
 // Built for humans & AI agents. https://cc0.company/docs/launchpad-sdk
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -36,6 +37,29 @@ export type { ClaimableFees, ClaimFeesResult } from './fees';
 // Staking
 export { Cc0Staking } from './staking';
 export type { StakingPosition } from './staking';
+
+// IPFS NFT drops (CC0Drop ERC721-C + CC0Drop1155)
+export {
+  Cc0Drops,
+  CC0_DROP_ABI,
+  CC0_DROP_1155_ABI,
+  computeAllowlistRoot,
+  computeAllowlistProof,
+  EMPTY_MERKLE_ROOT,
+} from './drops';
+export type {
+  Cc0DropsConfig,
+  AllowlistEntry,
+  PhaseInput,
+  AllowlistPhaseInput,
+  DeployDrop721Params,
+  DeployDrop1155Params,
+  DeployDropResult,
+  EditionInput,
+  DropMetadataInput,
+  PinDropMetadataResult,
+  PinResult,
+} from './drops';
 
 // Addresses + protocol constants + chains (Base 8453 · Ethereum 1 · Robinhood Chain 4663)
 export {
