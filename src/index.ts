@@ -54,6 +54,8 @@ export type {
   AllowlistPhaseInput,
   DeployDrop721Params,
   DeployDrop1155Params,
+  LaunchDrop721Params,
+  LaunchDrop1155Params,
   DeployDropResult,
   EditionInput,
   DropMetadataInput,

@@ -299,6 +299,24 @@ export interface DeployDrop1155Params extends Omit<DeployDrop721Params, 'maxSupp
   firstEdition: EditionInput;
 }
 
+/** One-call params: like DeployDrop721Params but you pass the raw `image`
+ *  (bytes / Blob / dataURL / https URL) instead of a pre-pinned `baseURI` — the
+ *  SDK pins the art + metadata for you, deploys, and records on cc0.company. */
+export interface LaunchDrop721Params
+  extends Omit<DeployDrop721Params, 'baseURI' | 'contractURI' | 'collectionImage'> {
+  image: Uint8Array | ArrayBuffer | Blob | string;
+  imageFilename?: string;
+  attributes?: Array<{ trait_type: string; value: string | number }>;
+  externalUrl?: string;
+}
+export interface LaunchDrop1155Params
+  extends Omit<DeployDrop1155Params, 'baseURI' | 'contractURI' | 'collectionImage'> {
+  image: Uint8Array | ArrayBuffer | Blob | string;
+  imageFilename?: string;
+  attributes?: Array<{ trait_type: string; value: string | number }>;
+  externalUrl?: string;
+}
+
 export interface DeployDropResult {
   contractAddress: Address;
   txHash: Hash;
@@ -882,6 +900,57 @@ export class Cc0Drops {
     return { contractAddress, txHash: hash, recorded, tokenId };
   }
 
+  // ─── One-call launch (pin art → pin metadata → deploy → record) ───────────
+  //     The single most robust entry point for step-limited agents: ONE method,
+  //     any signer (walletClient / Bankr / CDP sender), live on cc0.company.
+
+  /** Pin art + metadata, deploy a CC0Drop (ERC721), and record it — one call. */
+  async launchDrop721(
+    p: LaunchDrop721Params,
+  ): Promise<DeployDropResult & { baseURI: string; imageIpfsUri: string }> {
+    const art = await this.pinArt(p.image, p.imageFilename);
+    const meta = await this.pinDropMetadata({
+      name: p.name,
+      description: p.description,
+      image: art.ipfsUri,
+      attributes: p.attributes,
+      externalUrl: p.externalUrl,
+      royaltyBps: p.royaltyBps,
+      royaltyRecipient: p.royaltyRecipient,
+    });
+    const res = await this.deployDrop721({
+      ...p,
+      baseURI: meta.baseURI,
+      contractURI: meta.contractURI,
+      // Gateway URL so the drop is never blank on the frontend while IPFS warms.
+      collectionImage: art.url,
+    });
+    return { ...res, baseURI: meta.baseURI, imageIpfsUri: art.ipfsUri };
+  }
+
+  /** Pin art + metadata, deploy a CC0Drop1155 (first edition), and record — one call. */
+  async launchDrop1155(
+    p: LaunchDrop1155Params,
+  ): Promise<DeployDropResult & { tokenId: number; baseURI: string; imageIpfsUri: string }> {
+    const art = await this.pinArt(p.image, p.imageFilename);
+    const meta = await this.pinDropMetadata({
+      name: p.name,
+      description: p.description,
+      image: art.ipfsUri,
+      attributes: p.attributes,
+      externalUrl: p.externalUrl,
+      royaltyBps: p.royaltyBps,
+      royaltyRecipient: p.royaltyRecipient,
+    });
+    const res = await this.deployDrop1155({
+      ...p,
+      baseURI: meta.baseURI,
+      contractURI: meta.contractURI,
+      collectionImage: art.url,
+    });
+    return { ...res, baseURI: meta.baseURI, imageIpfsUri: art.ipfsUri };
+  }
+
   // ─── Record (cc0.company persistence — best-effort, like registerLaunch) ──
 
   /**
@@ -910,58 +979,81 @@ export class Cc0Drops {
     profileId?: string;
     allowlist?: { root: Hex; entries: AllowlistEntry[]; phase?: AllowlistPhaseInput };
   }): Promise<boolean> {
+    // Shared record fields for both attribution paths.
+    const seadropAllowlist = p.allowlist
+      ? {
+          kind: 'cc0drop',
+          merkleRoot: p.allowlist.root,
+          phase: {
+            priceEth: p.allowlist.phase?.priceEth ?? '0',
+            startTime: p.allowlist.phase?.start ?? 0,
+            endTime: p.allowlist.phase?.end ?? 0,
+            maxSupplyForPhase: p.allowlist.phase?.maxSupplyForPhase ?? 0,
+          },
+          entries: dedupeEntries(p.allowlist.entries).map((e) => ({
+            address: e.address.toLowerCase(),
+            quantity: Math.max(1, Math.floor(e.quantity)),
+          })),
+        }
+      : undefined;
+    const base = {
+      name: p.name,
+      symbol: p.symbol,
+      description: p.description,
+      contract_address: p.contractAddress,
+      base_uri: p.baseURI,
+      contract_uri: p.contractURI,
+      chain: this.chainSlug,
+      deployment_tx_hash: p.deploymentTxHash,
+      max_supply: p.maxSupply != null ? String(p.maxSupply) : undefined,
+      mint_price: p.mintPriceEth,
+      royalty_bps: p.royaltyBps,
+      royalty_recipient: p.royaltyRecipient,
+      max_per_wallet: p.maxPerWallet,
+      collection_image: p.collectionImage,
+      drop_contract: 'cc0drop',
+      token_standard: p.tokenStandard ?? 'ERC721',
+      token_id_1155: p.tokenId1155,
+      seadrop_allowlist: seadropAllowlist,
+    };
+    const timeout = () =>
+      typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(15_000) : undefined;
+
+    // 1. Registered-agent path — attribute to the resolved profile (also
+    //    persists social_links). Skipped cleanly if not registered.
     try {
       let profileId = p.profileId;
       if (!profileId) {
         const agent = await this.resolveAgent();
         profileId = agent?.profile_id;
       }
-      if (!profileId) return false;
-      const res = await fetch(`${this.registryUrl}/api/store/nft-minting/seadrop/record`, {
+      if (profileId) {
+        const res = await fetch(`${this.registryUrl}/api/store/nft-minting/seadrop/record`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...base, profile_id: profileId, social_links: p.socialLinks ?? null }),
+          signal: timeout(),
+        });
+        if (res.ok) return true;
+      }
+    } catch {
+      /* fall through to the owner-derived path */
+    }
+
+    // 2. Fallback — record-onbehalf derives the creator from the on-chain
+    //    owner() (== the signer's wallet, since it self-deployed) and creates a
+    //    shadow profile if needed. This GUARANTEES the drop reaches the frontend
+    //    even when the signer isn't a registered agent. Best-effort: the drop is
+    //    onchain regardless.
+    try {
+      const res = await fetch(`${this.registryUrl}/api/store/nft-minting/seadrop/record-onbehalf`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: p.name,
-          symbol: p.symbol,
-          description: p.description,
-          contract_address: p.contractAddress,
-          base_uri: p.baseURI,
-          contract_uri: p.contractURI,
-          chain: this.chainSlug,
-          deployment_tx_hash: p.deploymentTxHash,
-          max_supply: p.maxSupply != null ? String(p.maxSupply) : undefined,
-          mint_price: p.mintPriceEth,
-          royalty_bps: p.royaltyBps,
-          royalty_recipient: p.royaltyRecipient,
-          max_per_wallet: p.maxPerWallet,
-          collection_image: p.collectionImage,
-          social_links: p.socialLinks ?? null,
-          drop_contract: 'cc0drop',
-          token_standard: p.tokenStandard ?? 'ERC721',
-          token_id_1155: p.tokenId1155,
-          profile_id: profileId,
-          seadrop_allowlist: p.allowlist
-            ? {
-                kind: 'cc0drop',
-                merkleRoot: p.allowlist.root,
-                phase: {
-                  priceEth: p.allowlist.phase?.priceEth ?? '0',
-                  startTime: p.allowlist.phase?.start ?? 0,
-                  endTime: p.allowlist.phase?.end ?? 0,
-                  maxSupplyForPhase: p.allowlist.phase?.maxSupplyForPhase ?? 0,
-                },
-                entries: dedupeEntries(p.allowlist.entries).map((e) => ({
-                  address: e.address.toLowerCase(),
-                  quantity: Math.max(1, Math.floor(e.quantity)),
-                })),
-              }
-            : undefined,
-        }),
-        signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(15_000) : undefined,
+        body: JSON.stringify(base),
+        signal: timeout(),
       });
       return res.ok;
     } catch {
-      /* best-effort — the drop lives onchain regardless */
       return false;
     }
   }
