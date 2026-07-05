@@ -36,6 +36,8 @@
 import {
   createPublicClient,
   createWalletClient,
+  decodeEventLog,
+  encodeDeployData,
   encodeFunctionData,
   encodePacked,
   getAddress,
@@ -75,6 +77,63 @@ const AGENT_AUTH_SCOPE = 'cc0.company:agent-auth';
 /** Gas fallback ceilings (estimate × 1.2 is used when estimation succeeds). */
 const GAS_FALLBACK_CALL = BigInt(900_000);
 const GAS_FALLBACK_MINT = BigInt(500_000);
+/** A CC0Drop factory deploy is heavy (~3.7M — the constructor seeds the Limit
+ *  Break V5 validator list). Estimate × 1.3 is used when estimation succeeds. */
+const GAS_FALLBACK_DEPLOY = BigInt(6_000_000);
+
+/**
+ * CC0CollectionFactory — a GENERIC CREATE2 deployer: `deployCollection(bytes
+ * creationBytecode, …, salt)` runs `create2(creationBytecode)` verbatim, so it
+ * deploys the full CC0Drop / CC0Drop1155 creation code. This is what lets a
+ * signer-only wallet (Bankr / CDP `sender`) deploy: a raw contract-creation tx
+ * has no `to` and a `sender` transport can't express it, but a factory call is
+ * a NORMAL call with a real `to` — plain raw calldata any wallet can broadcast.
+ * The deployed contract's owner is the `_owner` constructor arg (the creator),
+ * NOT msg.sender, so factory-deploying doesn't change ownership.
+ */
+const CC0_FACTORY: Partial<Record<Cc0ChainSlug, Address>> = {
+  base: '0xB9585C09B6A78a16Bfb18D5b49D7F43431623065',
+  ethereum: '0x343d77D94A119D5cEA495aeE8336A3a7Aa5CD385',
+};
+const CC0_FACTORY_ABI = [
+  {
+    name: 'deployCollection',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'creationBytecode', type: 'bytes' },
+      { name: 'name', type: 'string' },
+      { name: 'symbol', type: 'string' },
+      { name: 'maxSupply', type: 'uint256' },
+      { name: 'creator', type: 'address' },
+      { name: 'uploader', type: 'address' },
+      { name: 'salt', type: 'bytes32' },
+    ],
+    outputs: [{ name: 'collection', type: 'address' }],
+  },
+  {
+    name: 'predictAddress',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'creationBytecode', type: 'bytes' },
+      { name: 'salt', type: 'bytes32' },
+    ],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    name: 'CollectionDeployed',
+    type: 'event',
+    inputs: [
+      { name: 'collection', type: 'address', indexed: true },
+      { name: 'creator', type: 'address', indexed: true },
+      { name: 'uploader', type: 'address', indexed: true },
+      { name: 'name', type: 'string', indexed: false },
+      { name: 'symbol', type: 'string', indexed: false },
+      { name: 'maxSupply', type: 'uint256', indexed: false },
+    ],
+  },
+] as const;
 
 // ─── Minimal ABI fragments (management + mint; full ABI is fetched for deploys) ──
 
@@ -592,21 +651,116 @@ export class Cc0Drops {
     return json;
   }
 
-  // ─── Deploys (walletClient/account only — raw CREATE txs) ─────────────────
+  // ─── Deploys — a viem walletClient signs a native CREATE; a signer-only
+  //     sender (Bankr / CDP) can't express a `to:null` creation tx, so it
+  //     deploys the SAME creation code through the CC0 factory as a plain
+  //     raw-calldata call. Either way you get one signature, no orchestrator. ──
 
-  private deployClient(): WalletClient {
-    if (!this.walletClient?.account) {
-      throw new Error(
-        'Contract deploys need a walletClient or account (a raw contract-creation tx has no `to`, ' +
-          'which ExternalSender transports cannot express). Managing and minting work with any signer.',
-      );
+  private async deployCreation(
+    abi: Abi,
+    bytecode: Hex,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    args: any[],
+    name: string,
+    symbol: string,
+    maxSupply: bigint,
+  ): Promise<{ hash: Hash; contractAddress: Address }> {
+    // Path 1 — viem walletClient: native contract-creation tx (proven path).
+    if (this.walletClient?.account) {
+      const hash = await this.walletClient.deployContract({
+        account: this.walletClient.account,
+        chain: this.chain,
+        abi,
+        bytecode,
+        args,
+      });
+      const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
+      if (!receipt.contractAddress) throw new Error('Deploy receipt carried no contract address.');
+      return { hash, contractAddress: receipt.contractAddress as Address };
     }
-    return this.walletClient;
+    // Path 2 — signer-only sender (Bankr / CDP): deploy via the factory (a
+    // normal call it CAN broadcast). encodeDeployData builds the exact same
+    // creation code deployContract would have; the factory create2's it.
+    if (this.sender) {
+      const creationBytecode = encodeDeployData({ abi, bytecode, args });
+      return this.deployViaFactory(creationBytecode, name, symbol, maxSupply);
+    }
+    throw new Error('No signer configured. Pass walletClient, account, or sender to the constructor.');
+  }
+
+  /** Broadcast a factory `deployCollection()` call (raw calldata) via the
+   *  sender and resolve the deployed address from the CollectionDeployed event
+   *  (a factory call leaves the receipt's `contractAddress` null). */
+  private async deployViaFactory(
+    creationBytecode: Hex,
+    name: string,
+    symbol: string,
+    maxSupply: bigint,
+  ): Promise<{ hash: Hash; contractAddress: Address }> {
+    const factory = CC0_FACTORY[this.chainSlug];
+    if (!factory) {
+      throw new Error(`No CC0 collection factory configured for chain "${this.chainSlug}".`);
+    }
+    const creator = this.signerAddress();
+    // Unique per deploy so CREATE2 addresses never collide across drops.
+    const salt = keccak256(
+      encodePacked(['address', 'string', 'uint256'], [creator, name, BigInt(Date.now())]),
+    );
+    const data = encodeFunctionData({
+      abi: CC0_FACTORY_ABI,
+      functionName: 'deployCollection',
+      args: [creationBytecode, name, symbol, maxSupply, creator, creator, salt],
+    });
+
+    // Deterministic CREATE2 address — a best-effort fallback if the event scan misses.
+    let predicted: Address | null = null;
+    try {
+      predicted = (await this.publicClient.readContract({
+        address: factory,
+        abi: CC0_FACTORY_ABI,
+        functionName: 'predictAddress',
+        args: [creationBytecode, salt],
+      })) as Address;
+    } catch {
+      /* resolve from the event instead */
+    }
+
+    let gas = GAS_FALLBACK_DEPLOY;
+    try {
+      const estimated = await this.publicClient.estimateGas({
+        account: this.sender!.address,
+        to: factory,
+        data,
+      });
+      gas = (estimated * BigInt(130)) / BigInt(100); // +30% headroom
+    } catch {
+      /* keep the fallback ceiling */
+    }
+    const fees = await estimateEip1559Fees(this.publicClient);
+    const hash = await this.sender!.send(toPreparedTx(factory, data, BigInt(0), gas, fees, this.chainId));
+    assertTxHash(hash, 'Your sender.send()');
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
+    let contractAddress: Address | null = predicted;
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({ abi: CC0_FACTORY_ABI, data: log.data, topics: log.topics });
+        if (decoded.eventName === 'CollectionDeployed') {
+          contractAddress = (decoded.args as { collection: Address }).collection;
+          break;
+        }
+      } catch {
+        /* not our event — keep scanning */
+      }
+    }
+    if (!contractAddress) {
+      throw new Error('Factory deploy landed but neither the CollectionDeployed event nor prediction resolved the address.');
+    }
+    return { hash, contractAddress };
   }
 
   /** Deploy a CC0Drop (ERC721-C) — one signature — then record it on cc0.company. */
   async deployDrop721(p: DeployDrop721Params): Promise<DeployDropResult> {
-    const wallet = this.deployClient();
     const artifacts = await this.getArtifacts();
     const creator = this.signerAddress();
     const royaltyRecipient = p.royaltyRecipient ?? creator;
@@ -615,12 +769,10 @@ export class Cc0Drops {
     const allowlistPhase = buildAllowlistPhase(p.allowlist);
     const root = p.allowlist?.entries?.length ? computeAllowlistRoot(p.allowlist.entries) : EMPTY_MERKLE_ROOT;
 
-    const hash = await wallet.deployContract({
-      account: wallet.account!,
-      chain: this.chain,
-      abi: artifacts.contracts.erc721.abi as Abi,
-      bytecode: artifacts.contracts.erc721.bytecode as Hex,
-      args: [
+    const { hash, contractAddress } = await this.deployCreation(
+      artifacts.contracts.erc721.abi as Abi,
+      artifacts.contracts.erc721.bytecode as Hex,
+      [
         p.name,
         p.symbol,
         p.baseURI,
@@ -636,10 +788,10 @@ export class Cc0Drops {
         artifacts.platformFeeRecipient as Address,
         creator, // _owner
       ],
-    });
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
-    const contractAddress = receipt.contractAddress as Address | null;
-    if (!contractAddress) throw new Error('Deploy receipt carried no contract address.');
+      p.name,
+      p.symbol,
+      BigInt(p.maxSupply),
+    );
 
     let recorded = false;
     if (p.record !== false) {
@@ -669,7 +821,6 @@ export class Cc0Drops {
 
   /** Deploy a CC0Drop1155 with its FIRST edition — one signature — then record. */
   async deployDrop1155(p: DeployDrop1155Params): Promise<DeployDropResult & { tokenId: number }> {
-    const wallet = this.deployClient();
     const artifacts = await this.getArtifacts();
     const creator = this.signerAddress();
     const royaltyRecipient = p.royaltyRecipient ?? creator;
@@ -678,12 +829,10 @@ export class Cc0Drops {
     const tokenId = ed.tokenId ?? 1;
     const root = ed.allowlist?.entries?.length ? computeAllowlistRoot(ed.allowlist.entries) : EMPTY_MERKLE_ROOT;
 
-    const hash = await wallet.deployContract({
-      account: wallet.account!,
-      chain: this.chain,
-      abi: artifacts.contracts.erc1155.abi as Abi,
-      bytecode: artifacts.contracts.erc1155.bytecode as Hex,
-      args: [
+    const { hash, contractAddress } = await this.deployCreation(
+      artifacts.contracts.erc1155.abi as Abi,
+      artifacts.contracts.erc1155.bytecode as Hex,
+      [
         p.name,
         p.symbol,
         p.baseURI,
@@ -702,10 +851,10 @@ export class Cc0Drops {
         artifacts.platformFeeRecipient as Address,
         creator,
       ],
-    });
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
-    const contractAddress = receipt.contractAddress as Address | null;
-    if (!contractAddress) throw new Error('Deploy receipt carried no contract address.');
+      p.name,
+      p.symbol,
+      BigInt(ed.maxSupply),
+    );
 
     let recorded = false;
     if (p.record !== false) {
