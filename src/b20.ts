@@ -854,7 +854,13 @@ export class Cc0B20Launchpad {
       const cap = parseUnits(cfg.supplyCap.trim(), B20_LAUNCH_DECIMALS);
       if (cap >= supplyBaseUnits) {
         step('Setting the supply cap…');
-        await soft('Supply cap', () => writeFn(token, B20_TOKEN_ABI, 'updateSupplyCap', [cap]));
+        try {
+          await writeFn(token, B20_TOKEN_ABI, 'updateSupplyCap', [cap]);
+        } catch {
+          // No retry (the follow-up tx can flake right after the deploy) — tell the creator they
+          // can cap the supply from the token dashboard (they're the admin).
+          warnings.push('Supply cap not set yet — you can cap the supply anytime from your token dashboard.');
+        }
       } else {
         warnings.push('Supply cap below the minted supply — skipped.');
       }
