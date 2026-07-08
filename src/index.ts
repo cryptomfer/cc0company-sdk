@@ -1,10 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════════
 // @cc0company/sdk — the official cc0.company SDK.
 //
-//   • Cc0Launchpad — launch tokens with the on-chain enforced 75/15/10 fee split
-//   • Cc0Fees      — read + claim creator trading fees
-//   • Cc0Staking   — stake $cc0company, earn WETH from every launch
-//   • Cc0Drops     — deploy, manage + mint IPFS NFT drops (CC0Drop 721 / 1155)
+//   • Cc0Launchpad    — launch tokens with the on-chain enforced 75/15/10 fee split
+//   • Cc0B20Launchpad — launch tradeable B20s (Base-native standard), same split
+//   • Cc0Fees         — read + claim creator trading fees
+//   • Cc0Staking      — stake $cc0company, earn WETH from every launch
+//   • Cc0Drops        — deploy, manage + mint IPFS NFT drops (CC0Drop 721 / 1155)
 //
 // Built for humans & AI agents. https://cc0.company/docs/launchpad-sdk
 // ═══════════════════════════════════════════════════════════════════════════════════
@@ -31,6 +32,28 @@ export type {
   CreatorRewardSlice,
   CreatorFeePreference,
 } from './launchpad';
+
+// B20 launchpad (Base-only — tradeable B20s with the same enforced 75/15/10 split)
+export {
+  Cc0B20Launchpad,
+  B20_FACTORY_ABI,
+  B20_LAUNCHPAD_CONTRACTS,
+  B20_LAUNCH_DECIMALS,
+  B20_POLICY_REGISTRY_ADDRESS,
+  B20_POLICY_TYPE,
+  B20_ROLES,
+  B20_SCOPES,
+  isB20LaunchpadAvailable,
+} from './b20';
+export type {
+  B20ComplianceMode,
+  B20LaunchConfig,
+  B20LaunchpadContracts,
+  B20RoleGrant,
+  Cc0B20Config,
+  LaunchB20Params,
+  LaunchB20Result,
+} from './b20';
 
 // Creator fees
 export { Cc0Fees } from './fees';

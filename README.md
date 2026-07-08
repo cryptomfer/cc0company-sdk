@@ -211,6 +211,36 @@ const { tokenAddress, registered } = await launchpad.finishLaunch({
 });
 ```
 
+## Launch a B20 (Base-only)
+
+B20 is Base's native token standard. `Cc0B20Launchpad` launches a **tradeable B20** —
+same Uniswap V4 pool, same enforced 75/15/10 fee split, same extensions (vault, airdrop,
+dev buy, sniper tax) as the ERC-20 launchpad — the factory just mints a B20 via Base's
+precompile instead of an ERC-20.
+
+```typescript
+import { Cc0B20Launchpad } from '@cc0company/sdk';
+
+const b20 = new Cc0B20Launchpad({ walletClient, chainId: 84532 }); // Base Sepolia today
+const { tokenAddress, configWarnings } = await b20.launchB20({
+  name: 'My B20',
+  symbol: 'MYB20',
+  image: 'ipfs://…',
+  supply: '1000000000',   // whole tokens; empty = the 100B default
+  lpPreset: 'degen',      // 'classic' (default, deep) | 'degen' (thin — price moves ~7× easier)
+  adminMode: 'trustless', // default: admin-less at birth, supply fixed forever
+});
+```
+
+`adminMode: 'managed'` keeps you as the token's admin and lets the optional `b20` config
+apply a supply cap, role grants, an allowlist/blocklist compliance policy, or freeze &
+seize right after launch — each step is fail-soft and reported in `configWarnings`.
+
+Availability is **fail-closed**: Base Sepolia (84532) is live; the Base-mainnet entry
+ships pre-staged and the constructor refuses `chainId: 8453` until the audited mainnet
+cutover lands. Works with `walletClient`, `account`, or `sender` — exactly like
+`Cc0Launchpad`.
+
 ## Claim your creator fees
 
 ```typescript
