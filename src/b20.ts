@@ -21,6 +21,7 @@ import {
   Cc0Launchpad,
   FACTORY_ABI,
   LP_PRESETS,
+  startingTickForSupply,
   assertTxHash,
   estimateEip1559Fees,
   parseLaunchReceipt,
@@ -601,7 +602,6 @@ export class Cc0B20Launchpad {
         `Unknown lpPreset "${lpPreset}" — use one of: ${Object.keys(LP_PRESETS).join(', ')}.`,
       );
     }
-    const startingTick = LP_PRESETS[lpPreset].startingTick;
 
     // Pin the image FIRST — the URI goes on-chain forever (fail-closed permanence).
     const imageUri = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
@@ -615,6 +615,14 @@ export class Cc0B20Launchpad {
       p.supply && p.supply.trim() !== ''
         ? parseUnits(p.supply.trim(), B20_LAUNCH_DECIMALS)
         : B20_DEFAULT_LAUNCH_SUPPLY;
+
+    // Starting tick ADJUSTED for the supply so the preset's FDV holds — a fixed tick + a tiny custom
+    // supply prices the whole pool at ~$0 and one small buy drains it. Feeds both
+    // tickIfToken0IsClanker AND tickLower[0] below.
+    const startingTick = startingTickForSupply(
+      lpPreset,
+      Number(supplyBaseUnits / 10n ** BigInt(B20_LAUNCH_DECIMALS)),
+    );
 
     // ── fee hook + feeData ──
     const feeMode = p.feeMode ?? 'static';

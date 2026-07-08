@@ -62,6 +62,28 @@ export const LP_PRESETS = {
 /** Liquidity profile name ('classic' default | 'degen'). */
 export type Cc0LpPreset = keyof typeof LP_PRESETS;
 
+/** Supply the preset ticks are calibrated for (the historical + B20 default), in WHOLE tokens. */
+export const DEFAULT_SUPPLY_WHOLE = 100_000_000_000;
+
+/**
+ * Starting tick that holds a preset's FDV constant across ANY launch supply. The preset ticks fix
+ * the price PER TOKEN, calibrated for the 100B default (FDV = supply × price). A custom supply (B20)
+ * at the fixed tick keeps that per-token price, so its FDV collapses proportionally — e.g. 69 tokens
+ * price the whole pool at ~$0 and one tiny buy drains it. Shifting the tick by
+ * ln(DEFAULT / supply) / ln(1.0001) restores the FDV to the preset's target for any supply; the 100B
+ * default returns the base tick unchanged. Result is a multiple of TICK_SPACING, clamped to range.
+ */
+export function startingTickForSupply(preset: Cc0LpPreset, supplyWhole: number): number {
+  const base = LP_PRESETS[preset].startingTick;
+  const s = Number.isFinite(supplyWhole) && supplyWhole > 0 ? supplyWhole : DEFAULT_SUPPLY_WHOLE;
+  if (s === DEFAULT_SUPPLY_WHOLE) return base;
+  const shift = Math.log(DEFAULT_SUPPLY_WHOLE / s) / Math.log(1.0001);
+  let tick = Math.round((base + shift) / 200) * 200; // TICK_SPACING = 200
+  if (tick > 887000) tick = 887000;
+  if (tick < -887200) tick = -887200;
+  return tick;
+}
+
 // Locker FeeIn enum: Both=0, Paired=1, Clanker(token)=2.
 const FEE_IN = { both: 0, paired: 1, token: 2 } as const;
 
