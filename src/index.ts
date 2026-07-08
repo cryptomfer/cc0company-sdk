@@ -13,6 +13,7 @@
 export {
   Cc0Launchpad,
   FACTORY_ABI,
+  LP_PRESETS,
   parseLaunchReceipt,
   toPreparedTx,
   estimateEip1559Fees,
@@ -20,6 +21,7 @@ export {
 } from './launchpad';
 export type {
   Cc0ClientConfig,
+  Cc0LpPreset,
   ExternalSender,
   LaunchTokenParams,
   LaunchTokenResult,

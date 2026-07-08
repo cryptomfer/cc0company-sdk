@@ -42,9 +42,25 @@ import {
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 // Pool constants (must mirror the launchpad's canonical pool shape).
-const STARTING_TICK = -230400;
 const MAX_TICK_UPPER = 887200;
 const TICK_SPACING = 200;
+
+/**
+ * Liquidity profiles. Both are the SAME single full-range one-sided LP — only the starting
+ * tick differs, which sets the starting FDV and therefore the depth (for a full-range LP the
+ * virtual WETH depth ≈ FDV at the current price):
+ *   • classic — ~9.9 WETH starting FDV (~$36k): deep, steady price. The historical default.
+ *   • degen   — ~1.3 WETH starting FDV (~$5k): thin, price ~7× more reactive at launch.
+ * Ticks must be multiples of TICK_SPACING and feed BOTH tickIfToken0IsClanker and
+ * tickLower[0] — if they diverge the LP mint stops being one-sided and the launch reverts.
+ */
+export const LP_PRESETS = {
+  classic: { startingTick: -230400 },
+  degen: { startingTick: -250400 },
+} as const;
+
+/** Liquidity profile name ('classic' default | 'degen'). */
+export type Cc0LpPreset = keyof typeof LP_PRESETS;
 
 // Locker FeeIn enum: Both=0, Paired=1, Clanker(token)=2.
 const FEE_IN = { both: 0, paired: 1, token: 2 } as const;
@@ -134,6 +150,11 @@ export interface LaunchTokenParams {
   };
   /** Optional dev buy: ETH spent buying the token at launch (e.g. "0.05"). */
   devBuyEth?: string;
+  /**
+   * Liquidity profile — 'classic' (default, ~$36k starting FDV, deep) or 'degen'
+   * (~$5k starting FDV, thin: the price needs ~7× less volume to move). See LP_PRESETS.
+   */
+  lpPreset?: Cc0LpPreset;
   /** Custom salt; random if omitted. */
   salt?: Hex;
   /**
@@ -654,7 +675,10 @@ export class Cc0Launchpad {
    */
   async finishLaunch(args: {
     txHash: Hash;
-    params: Pick<LaunchTokenParams, 'name' | 'symbol' | 'description' | 'airdrop' | 'register'>;
+    params: Pick<
+      LaunchTokenParams,
+      'name' | 'symbol' | 'description' | 'airdrop' | 'register' | 'lpPreset'
+    >;
     creator: Address;
     /** The resolved ipfs:// URI (from PreparedLaunchTransaction.imageUri). */
     imageUri?: string;
@@ -686,6 +710,7 @@ export class Cc0Launchpad {
         image: args.imageUri,
         creator: args.creator,
         hasAirdrop: !!args.params.airdrop,
+        lpPreset: args.params.lpPreset,
         nftFeeDistributor: args.nftDistributor,
         nftFeeCollection: args.nftCollection,
       });
@@ -754,6 +779,8 @@ export class Cc0Launchpad {
     image?: string;
     creator: Address;
     hasAirdrop?: boolean;
+    /** Liquidity profile the launch used — recorded for the token page badge. */
+    lpPreset?: Cc0LpPreset;
     /** Option B: the per-token NFT fee distributor + the collection whose holders earn. */
     nftFeeDistributor?: Address;
     nftFeeCollection?: Address;
@@ -773,6 +800,7 @@ export class Cc0Launchpad {
           image_url: params.image || undefined,
           creator_wallet: params.creator,
           has_airdrop: !!params.hasAirdrop,
+          ...(params.lpPreset ? { lp_preset: params.lpPreset } : {}),
           ...(params.nftFeeDistributor && params.nftFeeCollection
             ? {
                 nft_fee_distributor: params.nftFeeDistributor,
@@ -796,6 +824,16 @@ export class Cc0Launchpad {
     creator: Address,
   ): Promise<{ config: Record<string, unknown>; totalMsgValue: bigint; imageUri: string }> {
     const c = this.contracts;
+
+    // Liquidity profile → starting tick (⇒ starting FDV ⇒ depth). Fail on unknown
+    // names instead of silently launching a 'classic' the caller didn't ask for.
+    const lpPreset = p.lpPreset ?? 'classic';
+    if (!LP_PRESETS[lpPreset]) {
+      throw new Error(
+        `Unknown lpPreset "${lpPreset}" — use one of: ${Object.keys(LP_PRESETS).join(', ')}.`,
+      );
+    }
+    const startingTick = LP_PRESETS[lpPreset].startingTick;
 
     // Pin the image FIRST — its URI goes on-chain forever, so permanence is
     // guaranteed before any transaction is built (fail-closed by default).
@@ -1050,7 +1088,7 @@ export class Cc0Launchpad {
       poolConfig: {
         hook,
         pairedToken: c.WETH,
-        tickIfToken0IsClanker: STARTING_TICK,
+        tickIfToken0IsClanker: startingTick,
         tickSpacing: TICK_SPACING,
         poolData,
       },
@@ -1059,7 +1097,7 @@ export class Cc0Launchpad {
         rewardAdmins,
         rewardRecipients,
         rewardBps,
-        tickLower: [STARTING_TICK],
+        tickLower: [startingTick],
         tickUpper: [MAX_TICK_UPPER],
         positionBps: [10_000],
         lockerData,
