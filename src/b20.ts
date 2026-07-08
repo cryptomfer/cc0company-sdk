@@ -115,18 +115,18 @@ export const B20_LAUNCHPAD_CONTRACTS: Record<number, B20LaunchpadContracts> = {
     universalRouter: '0x492E6456D9528771018DeB9E87ef7750EF184104',
     weth: '0x4200000000000000000000000000000000000006',
   },
-  // Base mainnet (8453) — pre-staged; factory/hooks/locker land at the mainnet cutover.
+  // Base mainnet (8453) — LIVE, deployed + Basescan-verified 2026-07-08 (forge script DeployB20).
   8453: {
     chainId: 8453,
-    factory: '',
-    hookStaticFee: '',
-    hookDynamicFee: '',
-    locker: '',
-    mevBlockDelay: '',
-    mevSniperTax: '',
-    vault: '',
-    airdropV2: '',
-    devBuyV4: '',
+    factory: '0x826a2b79aBD77269fc861a36B88979daabe80C8B',
+    hookStaticFee: '0x0ae73DfA41f1AcaCF32ad050924384B295E968cc',
+    hookDynamicFee: '0xC8B624Ad72059c41b6e324c7840651E1DFa268Cc',
+    locker: '0x3E099Bc47ad5277ab0270160E90Ae7d6f4C0a0FD',
+    mevBlockDelay: '0xfC9a94dDca02A00400553898b50FdDB133269BC0',
+    mevSniperTax: '0x6Be662Ce74e6823Ebef906ed7A8D1Df50cEA37E6',
+    vault: '0x79D6E3f984d698ADf08BBa4139f47ea4137c28D2',
+    airdropV2: '0xB9f2D2f12d6e92aFbD599B97859FC21fc2aC08Bc',
+    devBuyV4: '0x401D658888739c65C0BFAE0Ce2a8d7aC5dfcBEE6',
     // Reused LIVE cc0strategy-v2 infra (the new locker points at these):
     feeLocker: '0xC04bdF721FA5CEc839819864FA86F3D48B89Fcee',
     poolManager: '0x498581fF718922c3f8e6A244956aF099B2652b2b',
