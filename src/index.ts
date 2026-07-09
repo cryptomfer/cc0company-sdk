@@ -46,17 +46,21 @@ export {
   Cc0B20Launchpad,
   B20_FACTORY_ABI,
   B20_LAUNCHPAD_CONTRACTS,
+  B20_LAUNCHPAD_PAIRED_CONTRACTS,
   B20_LAUNCH_DECIMALS,
   B20_POLICY_REGISTRY_ADDRESS,
   B20_POLICY_TYPE,
   B20_ROLES,
   B20_SCOPES,
+  getB20PairedLaunchpad,
   isB20LaunchpadAvailable,
+  isB20PairedLaunchpadAvailable,
 } from './b20';
 export type {
   B20ComplianceMode,
   B20LaunchConfig,
   B20LaunchpadContracts,
+  B20PairedLaunchpadContracts,
   B20RoleGrant,
   Cc0B20Config,
   LaunchB20Params,
@@ -99,8 +103,11 @@ export type {
 // Addresses + protocol constants + chains (Base 8453 · Ethereum 1 · Robinhood Chain 4663)
 export {
   CC0_CONTRACTS,
+  CC0_PAIRED_CONTRACTS,
   CHAIN_IDS,
   DEFAULT_RPCS,
+  getCc0PairedContracts,
+  isCc0PairedAvailable,
   PAIRED_SPLIT,
   PROTOCOL_SPLIT,
   robinhoodChain,
@@ -109,4 +116,4 @@ export {
   AIRDROP_MIN_LOCKUP_SECONDS,
   VIEM_CHAINS,
 } from './addresses';
-export type { Cc0Chain, Cc0ChainSlug } from './addresses';
+export type { Cc0Chain, Cc0ChainSlug, Cc0PairedContracts } from './addresses';

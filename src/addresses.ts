@@ -162,3 +162,67 @@ export const PAIRED_SPLIT = {
 /** On-chain extension minimums (from the vault / airdrop contracts). */
 export const VAULT_MIN_LOCKUP_SECONDS = 7 * 86400; // 7 days
 export const AIRDROP_MIN_LOCKUP_SECONDS = 86400; // 1 day
+
+// ═══ PAIRED launchpad (ERC-20) — a SEPARATE dual-mode suite, additive to the existing one ═══════
+//
+// PAIRED launches (pool vs an arbitrary ERC-20, enforced 80/20 creator/treasury, FeeIn.Both, no
+// staking slice) require the dual-mode factory (weth ctor immutable + _checkCc0PairedSplit). The
+// live suites in CC0_CONTRACTS above stay THE path for every standard WETH launch — they are never
+// re-pointed, never deprecated, and tokens already launched keep resolving on them forever. This
+// book only ADDS a second, independent suite used exclusively when `pairedToken` is set; while a
+// chain's entry is unfilled, paired launches there fail closed and nothing else changes.
+
+/** One PAIRED (dual-mode) ERC-20 launchpad deployment's address set. Pre-staged fields are ''. */
+export interface Cc0PairedContracts {
+  chainId: number;
+  FACTORY: Address | '';
+  HOOK_STATIC_FEE: Address | '';
+  HOOK_DYNAMIC_FEE: Address | '';
+  LOCKER: Address | '';
+  MEV_BLOCK_DELAY: Address | '';
+  MEV_SNIPER_TAX: Address | '';
+  VAULT: Address | '';
+  AIRDROP_V2: Address | '';
+  DEV_BUY_V4: Address | '';
+  /** Reused LIVE infra — shared with the standard suite on mainnet. */
+  FEE_LOCKER: Address;
+  STAKING: Address;
+  WETH: Address;
+  CC0COMPANY: Address;
+}
+
+/**
+ * Per-chain PAIRED ERC-20 launchpad deployments. Base is PRE-STAGED (empty factory) until the
+ * dual-mode suite's mainnet broadcast — `isCc0PairedAvailable('base')` stays false and every
+ * paired ERC-20 launch fails closed, so nothing can silently target a non-existent factory.
+ * Reused live infra (feeLocker/staking) is pre-filled — same shared fee locker as every launch.
+ */
+export const CC0_PAIRED_CONTRACTS: Partial<Record<Cc0ChainSlug, Cc0PairedContracts>> = {
+  base: {
+    chainId: 8453,
+    FACTORY: '',
+    HOOK_STATIC_FEE: '',
+    HOOK_DYNAMIC_FEE: '',
+    LOCKER: '',
+    MEV_BLOCK_DELAY: '',
+    MEV_SNIPER_TAX: '',
+    VAULT: '',
+    AIRDROP_V2: '',
+    DEV_BUY_V4: '',
+    FEE_LOCKER: '0xC04bdF721FA5CEc839819864FA86F3D48B89Fcee',
+    STAKING: '0x38cE743b88c54eD1aF84816Ff596E518d16DFF95',
+    WETH: '0x4200000000000000000000000000000000000006',
+    CC0COMPANY: '0x67c5F00491c09cbCF6359f95690574E6106bb3CF',
+  },
+};
+
+/** PAIRED-suite address book for a chain, or null when not deployed/filled there (fail-closed). */
+export function getCc0PairedContracts(chain?: Cc0Chain): Cc0PairedContracts | null {
+  const c = CC0_PAIRED_CONTRACTS[toChainSlug(chain)] ?? null;
+  return c && /^0x[a-fA-F0-9]{40}$/.test(c.FACTORY) ? c : null;
+}
+
+/** True when paired (80/20) ERC-20 launches are possible on `chain` (fail-closed). */
+export function isCc0PairedAvailable(chain?: Cc0Chain): boolean {
+  return getCc0PairedContracts(chain) !== null;
+}

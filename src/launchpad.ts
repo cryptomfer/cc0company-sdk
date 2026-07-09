@@ -20,6 +20,7 @@ import {
   CC0_CONTRACTS,
   CHAIN_IDS,
   DEFAULT_RPCS,
+  getCc0PairedContracts,
   PAIRED_SPLIT,
   PROTOCOL_SPLIT,
   toChainSlug,
@@ -42,9 +43,12 @@ import {
 // SDK keeps working if the platform ever rotates them (e.g. a staking v2).
 //
 // PAIRED LAUNCHES (custom pair): pass `pairedToken` to pair the pool with an arbitrary
-// ERC-20 instead of WETH. The factory then enforces an 80/20 creator/treasury split —
-// no staking slice (staking rewards are WETH-only; a paired-token slice would strand in
-// the fee locker) — and BOTH slices take fees in BOTH pool tokens. Base-only for now.
+// ERC-20 instead of WETH. The dual-mode factory then enforces an 80/20 creator/treasury
+// split — no staking slice (staking rewards are WETH-only; a paired-token slice would
+// strand in the fee locker) — and BOTH slices take fees in BOTH pool tokens. Paired
+// launches use a SEPARATE suite (CC0_PAIRED_CONTRACTS): the standard books above are
+// never re-pointed, and paired launches fail closed while a chain's paired suite is
+// unfilled (Base pre-staged, pending its broadcast).
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 // Pool constants (must mirror the launchpad's canonical pool shape).
@@ -289,9 +293,12 @@ export interface LaunchTokenParams {
    * becomes 80% you / 20% treasury (no staker slice — staking rewards are WETH-only)
    * and both slices take fees in BOTH pool tokens. symbol/decimals are read on-chain;
    * the WETH price resolves from the cc0.company price API unless `priceWeth` is set
-   * (fail-closed: no price, no launch). Base-only; dev buy + creatorRewards +
-   * nftCollection are not available for paired launches yet. undefined ⇒ standard
-   * WETH launch (unchanged 75/15/10 path).
+   * (fail-closed: no price, no launch). Paired launches deploy through a SEPARATE
+   * dual-mode suite (CC0_PAIRED_CONTRACTS) — check `isCc0PairedAvailable(chain)`;
+   * while a chain's paired suite is unfilled the launch throws (Base pending its
+   * broadcast). Dev buy + creatorRewards + nftCollection are not available for
+   * paired launches yet. undefined ⇒ standard WETH launch (unchanged 75/15/10 path
+   * on the existing suite).
    */
   pairedToken?: PairedTokenParam;
   /** Custom salt; random if omitted. */
@@ -590,15 +597,17 @@ export class Cc0Launchpad {
   /**
    * Read the enforced protocol slice addresses live from the factory (the contract
    * that validates the split on every deployToken). Fails closed: if the factory
-   * doesn't expose them, launching would revert anyway.
+   * doesn't expose them, launching would revert anyway. Paired launches pass the
+   * PAIRED suite's factory via `factoryOverride` — its enforced recipients are the
+   * ones the 80/20 config must name; omitted ⇒ the standard factory, unchanged.
    */
-  async getProtocolAddresses(): Promise<{
+  async getProtocolAddresses(factoryOverride?: Address): Promise<{
     staking: Address;
     treasury: Address;
     admin: Address;
   }> {
     try {
-      const factory = this.contracts.FACTORY;
+      const factory = factoryOverride ?? this.contracts.FACTORY;
       const [staking, treasury, admin] = await Promise.all([
         this.publicClient.readContract({ address: factory, abi: FACTORY_PROTOCOL_ABI, functionName: 'cc0Staking' }),
         this.publicClient.readContract({ address: factory, abi: FACTORY_PROTOCOL_ABI, functionName: 'cc0Treasury' }),
@@ -702,14 +711,13 @@ export class Cc0Launchpad {
       if (!account) throw new Error('walletClient has no account attached.');
       const creator = account.address as Address;
 
-      const { config, totalMsgValue, imageUri, paired } = await this.buildDeploymentConfig(
-        effective,
-        creator,
-      );
+      const { config, totalMsgValue, imageUri, paired, factory } =
+        await this.buildDeploymentConfig(effective, creator);
 
       const txHash = await this.walletClient.writeContract({
         account,
-        address: this.contracts.FACTORY,
+        // The PAIRED suite's factory for paired launches; the standard one otherwise.
+        address: factory,
         abi: FACTORY_ABI,
         functionName: 'deployToken',
         args: [config as never],
@@ -888,11 +896,10 @@ export class Cc0Launchpad {
     p: LaunchTokenParams,
     opts: { creator: Address },
   ): Promise<PreparedLaunchTransaction> {
-    const { config, totalMsgValue, imageUri, paired } = await this.buildDeploymentConfig(
-      p,
-      opts.creator,
-    );
-    const to = this.contracts.FACTORY;
+    const { config, totalMsgValue, imageUri, paired, factory } =
+      await this.buildDeploymentConfig(p, opts.creator);
+    // The PAIRED suite's factory for paired launches; the standard one otherwise.
+    const to = factory;
     const data = encodeFunctionData({
       abi: FACTORY_ABI,
       functionName: 'deployToken',
@@ -1000,6 +1007,8 @@ export class Cc0Launchpad {
     totalMsgValue: bigint;
     imageUri: string;
     paired?: PairedTokenOption;
+    /** The factory deployToken targets — the PAIRED suite's for paired launches. */
+    factory: Address;
   }> {
     const c = this.contracts;
 
@@ -1015,13 +1024,14 @@ export class Cc0Launchpad {
     // ── Paired launch (custom pair) — validate + resolve BEFORE any side effect ──
     // Pairing swaps the pool's quote asset from WETH to an arbitrary ERC-20: the fee
     // split becomes the two-slice 80/20 (creator/treasury, no staking — staking rewards
-    // are WETH-only) and BOTH slices take fees in BOTH pool tokens.
+    // are WETH-only) and BOTH slices take fees in BOTH pool tokens. Paired launches
+    // bind to the SEPARATE dual-mode PAIRED suite (CC0_PAIRED_CONTRACTS) — never the
+    // standard book — and fail closed while that suite is unfilled on the chain.
     let paired: PairedTokenOption | undefined;
+    const pairedBook = p.pairedToken ? getCc0PairedContracts(this.chainSlug) : null;
     if (p.pairedToken) {
-      if (this.chainSlug !== 'base') {
-        throw new Error(
-          'Paired launches are Base-only for now — construct the launchpad with chain: "base".',
-        );
+      if (!pairedBook) {
+        throw new Error('Paired launches are not available on this chain yet.');
       }
       if (p.devBuyEth && Number(p.devBuyEth) > 0) {
         throw new Error('Dev buy is not available for paired launches yet.');
@@ -1037,6 +1047,33 @@ export class Cc0Launchpad {
         weth: c.WETH,
       });
     }
+
+    // The suite this launch binds to: the WHOLE config (factory target, hooks, locker,
+    // MEV modules, extensions) comes from the PAIRED book for paired launches; standard
+    // WETH launches keep the existing book — untouched.
+    const suite = pairedBook
+      ? {
+          FACTORY: pairedBook.FACTORY as Address,
+          HOOK_STATIC_FEE: pairedBook.HOOK_STATIC_FEE as Address,
+          HOOK_DYNAMIC_FEE: pairedBook.HOOK_DYNAMIC_FEE as Address,
+          LOCKER: pairedBook.LOCKER as Address,
+          MEV_BLOCK_DELAY: pairedBook.MEV_BLOCK_DELAY as Address,
+          MEV_SNIPER_TAX: pairedBook.MEV_SNIPER_TAX as Address,
+          VAULT: pairedBook.VAULT as Address,
+          AIRDROP_V2: pairedBook.AIRDROP_V2 as Address,
+          DEV_BUY_V4: pairedBook.DEV_BUY_V4 as Address,
+        }
+      : {
+          FACTORY: c.FACTORY,
+          HOOK_STATIC_FEE: c.HOOK_STATIC_FEE,
+          HOOK_DYNAMIC_FEE: c.HOOK_DYNAMIC_FEE,
+          LOCKER: c.LOCKER,
+          MEV_BLOCK_DELAY: c.MEV_BLOCK_DELAY,
+          MEV_SNIPER_TAX: c.MEV_SNIPER_TAX,
+          VAULT: c.VAULT,
+          AIRDROP_V2: c.AIRDROP_V2,
+          DEV_BUY_V4: c.DEV_BUY_V4,
+        };
 
     // Paired pools are priced in the PAIRED token, so the preset tick (a WETH price)
     // is recomputed from the live paired price; the [0.5, 2] implied-FDV guard throws
@@ -1070,7 +1107,10 @@ export class Cc0Launchpad {
     }
 
     // ── Enforced protocol slices, read live from the factory ──────────────────
-    const protocol = await this.getProtocolAddresses();
+    // Paired launches read them from the PAIRED factory — the dual-mode contract that
+    // actually validates the 80/20 config (its recipients can differ from the standard
+    // suite's, e.g. the self-contained Sepolia test economics).
+    const protocol = await this.getProtocolAddresses(pairedBook ? suite.FACTORY : undefined);
 
     const rewardRecipients = paired
       ? [creator, protocol.treasury]
@@ -1098,7 +1138,7 @@ export class Cc0Launchpad {
     let hook: Address;
     let feeData: Hex;
     if (feeMode === 'dynamic') {
-      hook = c.HOOK_DYNAMIC_FEE;
+      hook = suite.HOOK_DYNAMIC_FEE;
       feeData = encodeAbiParameters(
         [
           { name: 'baseFee', type: 'uint24' },
@@ -1120,7 +1160,7 @@ export class Cc0Launchpad {
         ],
       );
     } else {
-      hook = c.HOOK_STATIC_FEE;
+      hook = suite.HOOK_STATIC_FEE;
       // 1e6 units: 1/2/3/6.9% -> 10000/20000/30000/69000. Round (6.9*10000 isn't exact in float).
       const feeUnits = Math.round((p.feeTier ?? 1) * 10_000);
       feeData = encodeAbiParameters(
@@ -1149,10 +1189,10 @@ export class Cc0Launchpad {
     );
 
     // ── MEV protection ────────────────────────────────────────────────────────
-    let mevModule: Address = c.MEV_BLOCK_DELAY;
+    let mevModule: Address = suite.MEV_BLOCK_DELAY;
     let mevModuleData: Hex = '0x';
     if (p.sniperTax) {
-      mevModule = c.MEV_SNIPER_TAX;
+      mevModule = suite.MEV_SNIPER_TAX;
       mevModuleData = encodeAbiParameters(
         [
           {
@@ -1185,7 +1225,7 @@ export class Cc0Launchpad {
 
     if (p.vault && p.vault.percentage > 0) {
       extensions.push({
-        extension: c.VAULT,
+        extension: suite.VAULT,
         msgValue: BigInt(0),
         extensionBps: Math.round(p.vault.percentage * 100),
         extensionData: encodeAbiParameters(
@@ -1214,7 +1254,7 @@ export class Cc0Launchpad {
 
     if (p.airdrop && p.airdrop.percentage > 0) {
       extensions.push({
-        extension: c.AIRDROP_V2,
+        extension: suite.AIRDROP_V2,
         msgValue: BigInt(0),
         extensionBps: Math.round(p.airdrop.percentage * 100),
         extensionData: encodeAbiParameters(
@@ -1247,7 +1287,7 @@ export class Cc0Launchpad {
       const ethValue = parseEther(p.devBuyEth);
       totalMsgValue += ethValue;
       extensions.push({
-        extension: c.DEV_BUY_V4,
+        extension: suite.DEV_BUY_V4,
         msgValue: ethValue,
         extensionBps: 0,
         extensionData: encodeAbiParameters(
@@ -1308,7 +1348,7 @@ export class Cc0Launchpad {
         poolData,
       },
       lockerConfig: {
-        locker: c.LOCKER,
+        locker: suite.LOCKER,
         rewardAdmins,
         rewardRecipients,
         rewardBps,
@@ -1321,7 +1361,7 @@ export class Cc0Launchpad {
       extensionConfigs: extensions,
     };
 
-    return { config, totalMsgValue, imageUri, paired };
+    return { config, totalMsgValue, imageUri, paired, factory: suite.FACTORY };
   }
 }
 

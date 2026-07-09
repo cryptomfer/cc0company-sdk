@@ -6,7 +6,8 @@ claim creator fees, and stake $cc0company — from any website, app, or AI agent
 - **`Cc0Launchpad`** — deploy a token on **Base, Ethereum, or Robinhood Chain** in one
   transaction, with the on-chain enforced **75/15/10** fee split: 75% of every trade's
   LP fee to you, 15% to $cc0company stakers, 10% to the platform. Or pair the pool with
-  **any ERC-20 instead of WETH** — an 80/20 paired launch (Base).
+  **any ERC-20 instead of WETH** — an 80/20 paired launch (B20s on Base Sepolia today;
+  Base mainnet pending).
 - **`Cc0Fees`** — read and claim your accrued trading fees (WETH + your token), on the
   chain you launched on.
 - **`Cc0Staking`** — stake $cc0company (on Base) and earn WETH from every launch on
@@ -248,10 +249,26 @@ ERC-20 instead — e.g. launch **$B69** trading against **$B420**. The fee split
 **80% you / 20% platform**, with no staker slice (staking rewards are WETH-only), and
 fees accrue in **both** pool tokens. Enforced on-chain, just like 75/15/10.
 
-```typescript
-import { Cc0B20Launchpad } from '@cc0company/sdk';
+Paired launches deploy through a **separate dual-mode contract suite** — the standard
+launchpads above are untouched and keep serving every WETH launch. Availability is
+**fail-closed** per chain (an unfilled paired suite throws
+`'Paired launches are not available on this chain yet.'`):
 
-const b20 = new Cc0B20Launchpad({ walletClient });
+| Launchpad | Paired suite | Status |
+|---|---|---|
+| B20 — Base Sepolia (84532) | `B20_LAUNCHPAD_PAIRED_CONTRACTS[84532]` | **Live** (own test feeLocker/staking) |
+| B20 — Base mainnet (8453) | `B20_LAUNCHPAD_PAIRED_CONTRACTS[8453]` | Pre-staged — pending broadcast |
+| ERC-20 — Base (8453) | `CC0_PAIRED_CONTRACTS.base` | Pre-staged — pending broadcast |
+
+Check before offering the option: `isB20PairedLaunchpadAvailable(chainId)` /
+`isCc0PairedAvailable(chain)`.
+
+```typescript
+import { Cc0B20Launchpad, isB20PairedLaunchpadAvailable } from '@cc0company/sdk';
+
+isB20PairedLaunchpadAvailable(84532); // true — paired B20s are live on Base Sepolia
+
+const b20 = new Cc0B20Launchpad({ walletClient, chainId: 84532 });
 const { tokenAddress } = await b20.launchB20({
   name: 'B69',
   symbol: 'B69',
@@ -266,8 +283,9 @@ const { tokenAddress } = await b20.launchB20({
 });
 ```
 
-The same `pairedToken` option works on the ERC-20 launchpad
-(`launchpad.launchToken({ …, pairedToken })`, Base-only). How it resolves:
+The same `pairedToken` option exists on the ERC-20 launchpad
+(`launchpad.launchToken({ …, pairedToken })` — throws until the Base paired suite is
+filled). How it resolves:
 
 - **symbol / decimals** are always read on-chain from the paired address.
 - **Price** — an explicit `priceWeth` wins; otherwise the SDK resolves it live from the
@@ -277,6 +295,9 @@ The same `pairedToken` option works on the ERC-20 launchpad
   decimals so the `lpPreset` FDV target still holds (exported as
   `startingTickForPairedLaunch` / `impliedFdvWethAtTick` if you want the preview math);
   a launch whose implied FDV would land outside 0.5×–2× of the preset target throws.
+- **Enforced recipients** (treasury/admin) are read live from the **paired** factory,
+  and the paired suite's fee locker holds the accrued fees (on Sepolia it's a separate
+  test locker; on mainnet both suites share the live one).
 - **Not available with pairing (yet):** `devBuyEth`, `creatorRewards`, `nftCollection`.
 
 ## Claim your creator fees

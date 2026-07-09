@@ -51,8 +51,12 @@ import { PAIRED_SPLIT, PROTOCOL_SPLIT } from './addresses';
 //     right after launch as follow-up transactions.
 //
 // PAIRED LAUNCHES (custom pair): pass `pairedToken` to pair the pool with an arbitrary
-// ERC-20 instead of WETH — the factory then enforces an 80/20 creator/treasury split
-// (no staking slice; staking rewards are WETH-only) with fees taken in BOTH pool tokens.
+// ERC-20 instead of WETH — the DUAL-MODE factory then enforces an 80/20 creator/treasury
+// split (no staking slice; staking rewards are WETH-only) with fees taken in BOTH pool
+// tokens. Paired launches use a SEPARATE suite (B20_LAUNCHPAD_PAIRED_CONTRACTS below):
+// the standard book stays THE path for every WETH launch, byte-for-byte. Paired is live
+// on Base Sepolia (its own dual-mode suite incl. a separate test feeLocker/staking) and
+// PRE-STAGED on Base mainnet — until that entry is filled, paired mainnet launches throw.
 //
 // FAIL-CLOSED availability: the launchpad is live on Base mainnet (8453, default) and
 // Base Sepolia (84532). Constructing against a chain whose factory isn't set throws
@@ -149,6 +153,91 @@ export const B20_LAUNCHPAD_CONTRACTS: Record<number, B20LaunchpadContracts> = {
 export function isB20LaunchpadAvailable(chainId: number): boolean {
   const c = B20_LAUNCHPAD_CONTRACTS[chainId];
   return !!c && /^0x[a-fA-F0-9]{40}$/.test(c.factory);
+}
+
+// ═══ PAIRED launchpad — a SEPARATE dual-mode suite, additive to the existing one ═══════
+//
+// PAIRED launches (pool vs an arbitrary ERC-20, enforced 80/20 creator/treasury,
+// FeeIn.Both, no staking slice) require the dual-mode factory (weth ctor immutable +
+// _checkCc0PairedSplit). The EXISTING suites above stay THE path for every standard WETH
+// launch — never re-pointed, never deprecated; tokens already launched keep resolving on
+// them forever. This block only ADDS a second, independent suite used exclusively when a
+// paired token is selected; while a chain's entry is unfilled, paired launches there fail
+// closed and nothing else changes.
+
+/** A PAIRED (dual-mode) suite's address set — the standard shape + its enforced-staking
+ *  recipient and the extra mirrored fields (airdrop v1, devBuyV3) kept for frontend-book
+ *  parity. On Sepolia the paired suite is self-contained (its OWN feeLocker/staking); on
+ *  mainnet it reuses the shared live feeLocker/staking, pre-filled below. */
+export interface B20PairedLaunchpadContracts extends B20LaunchpadContracts {
+  staking: Address;
+  airdrop: Address | '';
+  devBuyV3: Address | '';
+}
+
+/**
+ * Per-chain PAIRED B20 launchpad deployments — mirrors the cc0.company frontend book.
+ *   • Base Sepolia (84532) — dual-mode suite deployed 2026-07-10, e2e-proven incl. a live
+ *     paired launch. Self-contained: its OWN feeLocker/staking (fresh test economics), so
+ *     paired-launch fee reads on Sepolia must resolve THIS book's feeLocker.
+ *   • Base mainnet (8453) — PRE-STAGED (empty factory) until the dual-mode broadcast; the
+ *     shared LIVE feeLocker/staking are already filled. Until `factory` is real,
+ *     isB20PairedLaunchpadAvailable(8453) is false and paired mainnet launches throw.
+ */
+export const B20_LAUNCHPAD_PAIRED_CONTRACTS: Record<number, B20PairedLaunchpadContracts> = {
+  84532: {
+    chainId: 84532,
+    factory: '0x0a98D57699915598018E0CAe5A00F8850ec38966',
+    hookStaticFee: '0x6da0D206b5a0fFF28b59e0Da3AEa4ff28601a8cC',
+    hookDynamicFee: '0xC367F9b46EC29B075c9A98a33C85bAB2Faa5e8CC',
+    locker: '0xD502732da601097D41156B6A295cd227F635bbc6',
+    feeLocker: '0x1E2384B029c87dA7075C50524ac3Cf53C4f4FDE4',
+    staking: '0xb43f7BCEaB355110C63f5a821659d781d2531bAa',
+    mevBlockDelay: '0xE6DEb041cA8CE015d9CD6Ae38731d833C38d5f39',
+    mevSniperTax: '0x03E4e724Daad11159192A620FA4bb861deE41974',
+    vault: '0x2a2A5c4f44eF177f6d2674300355C9b243C5A2ac',
+    airdrop: '0x532581badE328f2b64921FAC0E9f294AD2FFB778',
+    airdropV2: '0xCAe0754a5fB52db7efa42f482AbC0Be8D63BF05e',
+    devBuyV4: '0x0C003114f418a3A4D61C170EDf0357Ce4Acb4F21',
+    devBuyV3: '0x3942675b018D975686684227d11E8dC1DdA67Ac3',
+    // Same V4 infra + WETH as the standard Sepolia entry:
+    poolManager: '0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408',
+    positionManager: '0x4B2C77d209D3405F41a037Ec6c77F7F5b8e2ca80',
+    universalRouter: '0x492E6456D9528771018DeB9E87ef7750EF184104',
+    weth: '0x4200000000000000000000000000000000000006',
+  },
+  8453: {
+    chainId: 8453,
+    factory: '',
+    hookStaticFee: '',
+    hookDynamicFee: '',
+    locker: '',
+    mevBlockDelay: '',
+    mevSniperTax: '',
+    vault: '',
+    airdrop: '',
+    airdropV2: '',
+    devBuyV4: '',
+    devBuyV3: '',
+    // Reused LIVE infra — same shared fee locker + staking as every launch:
+    feeLocker: '0xC04bdF721FA5CEc839819864FA86F3D48B89Fcee',
+    staking: '0x38cE743b88c54eD1aF84816Ff596E518d16DFF95',
+    poolManager: '0x498581fF718922c3f8e6A244956aF099B2652b2b',
+    positionManager: '0x7C5f5A4bBd8fD63184577525326123B519429bDc',
+    universalRouter: '0x6fF5693b99212Da76ad316178A184AB56D299b43',
+    weth: '0x4200000000000000000000000000000000000006',
+  },
+};
+
+/** PAIRED-suite address book for a chain, or null when not deployed/filled there (fail-closed). */
+export function getB20PairedLaunchpad(chainId: number): B20PairedLaunchpadContracts | null {
+  const c = B20_LAUNCHPAD_PAIRED_CONTRACTS[chainId] ?? null;
+  return c && /^0x[a-fA-F0-9]{40}$/.test(c.factory) ? c : null;
+}
+
+/** True when paired (80/20) B20 launches are possible on `chainId` (fail-closed). */
+export function isB20PairedLaunchpadAvailable(chainId: number): boolean {
+  return getB20PairedLaunchpad(chainId) !== null;
 }
 
 const B20_RPCS: Record<number, string> = {
@@ -323,8 +412,12 @@ export interface LaunchB20Params {
    * becomes 80% you / 20% treasury (no staker slice — staking rewards are WETH-only)
    * and both slices take fees in BOTH pool tokens. symbol/decimals are read on-chain;
    * the WETH price resolves from the cc0.company price API unless `priceWeth` is set
-   * (fail-closed: no price, no launch — on Sepolia pass it explicitly). Dev buy is not
-   * available for paired launches. undefined ⇒ standard WETH launch (75/15/10 path).
+   * (fail-closed: no price, no launch — on Sepolia pass it explicitly). Paired launches
+   * deploy through the SEPARATE dual-mode suite (B20_LAUNCHPAD_PAIRED_CONTRACTS) —
+   * check `isB20PairedLaunchpadAvailable(chainId)`: live on Base Sepolia (84532),
+   * PRE-STAGED on Base mainnet (throws until that suite is broadcast). Dev buy is not
+   * available for paired launches. undefined ⇒ standard WETH launch (75/15/10 path
+   * on the existing suite).
    */
   pairedToken?: PairedTokenParam;
   socials?: string[];
@@ -443,10 +536,14 @@ export class Cc0B20Launchpad {
     this.pinner = new Cc0Launchpad({ registryUrl: this.registryUrl });
   }
 
-  /** Read the enforced 75/15/10 recipients live from the B20 factory (fail-closed). */
-  async getProtocolAddresses(): Promise<{ staking: Address; treasury: Address; admin: Address }> {
+  /** Read the enforced recipients live from the B20 factory (fail-closed). Paired launches
+   *  pass the PAIRED suite's factory via `factoryOverride` — the dual-mode contract whose
+   *  cc0Treasury/cc0Admin the 80/20 config must name; omitted ⇒ the standard factory. */
+  async getProtocolAddresses(
+    factoryOverride?: Address,
+  ): Promise<{ staking: Address; treasury: Address; admin: Address }> {
     try {
-      const factory = this.contracts.factory as Address;
+      const factory = factoryOverride ?? (this.contracts.factory as Address);
       const [staking, treasury, admin] = await Promise.all([
         this.publicClient.readContract({ address: factory, abi: FACTORY_PROTOCOL_ABI, functionName: 'cc0Staking' }),
         this.publicClient.readContract({ address: factory, abi: FACTORY_PROTOCOL_ABI, functionName: 'cc0Treasury' }),
@@ -467,17 +564,16 @@ export class Cc0B20Launchpad {
    */
   async launchB20(p: LaunchB20Params): Promise<LaunchB20Result> {
     const creator = await this.resolveCreator();
-    const { config, totalMsgValue, supplyBaseUnits, paired } = await this.buildDeploymentConfig(
-      p,
-      creator,
-    );
+    const { config, totalMsgValue, supplyBaseUnits, paired, factory } =
+      await this.buildDeploymentConfig(p, creator);
 
     const data = encodeFunctionData({
       abi: B20_FACTORY_ABI,
       functionName: 'deployToken',
       args: [config as never],
     });
-    const txHash = await this.write(this.contracts.factory as Address, data, totalMsgValue);
+    // The PAIRED suite's factory for paired launches; the standard one otherwise.
+    const txHash = await this.write(factory, data, totalMsgValue);
 
     const receipt = await this.publicClient.waitForTransactionReceipt({
       hash: txHash,
@@ -630,6 +726,8 @@ export class Cc0B20Launchpad {
     totalMsgValue: bigint;
     supplyBaseUnits: bigint;
     paired?: PairedTokenOption;
+    /** The factory deployToken targets — the PAIRED suite's for paired launches. */
+    factory: Address;
   }> {
     const c = this.contracts;
 
@@ -642,9 +740,15 @@ export class Cc0B20Launchpad {
 
     // ── Paired launch (custom pair) — validate + resolve BEFORE any side effect ──
     // symbol/decimals read on-chain; priceWeth explicit or resolved live from the
-    // cc0.company price API (fail-closed — no price, no launch).
+    // cc0.company price API (fail-closed — no price, no launch). Paired launches bind
+    // to the SEPARATE dual-mode PAIRED suite (B20_LAUNCHPAD_PAIRED_CONTRACTS) — never
+    // the standard book — and fail closed while that suite is unfilled on the chain.
     let paired: PairedTokenOption | undefined;
+    const pairedBook = p.pairedToken ? getB20PairedLaunchpad(this.chainId) : null;
     if (p.pairedToken) {
+      if (!pairedBook) {
+        throw new Error('Paired launches are not available on this chain yet.');
+      }
       if (p.devBuyEth && Number(p.devBuyEth) > 0) {
         throw new Error('Dev buy is not available for paired launches yet.');
       }
@@ -655,10 +759,20 @@ export class Cc0B20Launchpad {
       });
     }
 
+    // The suite this launch binds to: the WHOLE config (factory target, hooks, locker,
+    // MEV modules, extensions) comes from the PAIRED book for paired launches; standard
+    // WETH launches keep the existing book — untouched.
+    const suite: B20LaunchpadContracts = pairedBook ?? c;
+
     // Pin the image FIRST — the URI goes on-chain forever (fail-closed permanence).
     const imageUri = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
 
-    const enforced = await this.getProtocolAddresses();
+    // Enforced recipients read from the factory the launch actually targets — the PAIRED
+    // dual-mode factory for paired launches (its recipients can differ, e.g. Sepolia's
+    // self-contained test economics), the standard factory otherwise.
+    const enforced = await this.getProtocolAddresses(
+      pairedBook ? (pairedBook.factory as Address) : undefined,
+    );
     const rewardRecipient = (p.rewardRecipient ?? creator) as Address;
 
     // Custom launch supply (whole tokens) → base units. parseUnits, never Number()*1e18
@@ -682,7 +796,7 @@ export class Cc0B20Launchpad {
     let hook: Address;
     let feeData: Hex;
     if (feeMode === 'dynamic') {
-      hook = c.hookDynamicFee as Address;
+      hook = suite.hookDynamicFee as Address;
       feeData = encodeAbiParameters(
         [
           { name: 'baseFee', type: 'uint24' },
@@ -704,7 +818,7 @@ export class Cc0B20Launchpad {
         ],
       );
     } else {
-      hook = c.hookStaticFee as Address;
+      hook = suite.hookStaticFee as Address;
       const feeUnits = Math.round((p.feeTier ?? 1) * 10_000);
       feeData = encodeAbiParameters(
         [{ name: 'clankerFee', type: 'uint24' }, { name: 'pairedFee', type: 'uint24' }],
@@ -740,7 +854,7 @@ export class Cc0B20Launchpad {
     let mevModule: Address;
     let mevModuleData: Hex;
     if (p.sniperTax) {
-      mevModule = c.mevSniperTax as Address;
+      mevModule = suite.mevSniperTax as Address;
       mevModuleData = encodeAbiParameters(
         [{
           type: 'tuple',
@@ -757,7 +871,7 @@ export class Cc0B20Launchpad {
         }],
       );
     } else {
-      mevModule = c.mevBlockDelay as Address;
+      mevModule = suite.mevBlockDelay as Address;
       mevModuleData = '0x';
     }
 
@@ -768,7 +882,7 @@ export class Cc0B20Launchpad {
     if (p.vault && p.vault.percentage > 0) {
       const lockup = Math.max(p.vault.lockupSeconds, 7 * 86400);
       extensions.push({
-        extension: c.vault as Address,
+        extension: suite.vault as Address,
         msgValue: BigInt(0),
         extensionBps: Math.round(p.vault.percentage * 100),
         extensionData: encodeAbiParameters(
@@ -791,7 +905,7 @@ export class Cc0B20Launchpad {
     if (p.airdrop && p.airdrop.percentage > 0) {
       const lockup = Math.max(p.airdrop.lockupSeconds ?? 0, 86400);
       extensions.push({
-        extension: c.airdropV2 as Address,
+        extension: suite.airdropV2 as Address,
         msgValue: BigInt(0),
         extensionBps: Math.round(p.airdrop.percentage * 100),
         extensionData: encodeAbiParameters(
@@ -817,7 +931,7 @@ export class Cc0B20Launchpad {
       const ethValue = parseEther(p.devBuyEth);
       totalMsgValue += ethValue;
       extensions.push({
-        extension: c.devBuyV4 as Address,
+        extension: suite.devBuyV4 as Address,
         msgValue: ethValue,
         extensionBps: 0, // takes no supply — it BUYS from the fresh pool
         extensionData: encodeAbiParameters(
@@ -870,7 +984,7 @@ export class Cc0B20Launchpad {
         poolData,
       },
       lockerConfig: {
-        locker: c.locker,
+        locker: suite.locker,
         rewardAdmins: paired
           ? [creator, enforced.admin]
           : [creator, enforced.admin, enforced.admin],
@@ -889,7 +1003,7 @@ export class Cc0B20Launchpad {
       extensionConfigs: extensions,
     };
 
-    return { config, totalMsgValue, supplyBaseUnits, paired };
+    return { config, totalMsgValue, supplyBaseUnits, paired, factory: suite.factory as Address };
   }
 
   /** Apply the managed B20-native config to the live token. Each step is fail-soft. */
@@ -955,11 +1069,22 @@ export class Cc0B20Launchpad {
       await soft('Compliance policy', async () => {
         step('Creating the compliance policy…');
         // pool/router/locker/positionManager/feeLocker/WETH must keep moving the token.
+        // A PAIRED launch trades through the PAIRED suite's locker/feeLocker — include
+        // them too (extra allowlisted infra is harmless; a missing locker bricks trading).
         const c = this.contracts;
+        const pairedInfra = p.pairedToken ? getB20PairedLaunchpad(this.chainId) : null;
         const infra = dedupeAddrs(
-          [c.poolManager, c.universalRouter, c.positionManager, c.locker as Address, c.feeLocker, c.weth].map(
-            (x) => getAddress(x),
-          ),
+          [
+            c.poolManager,
+            c.universalRouter,
+            c.positionManager,
+            c.locker as Address,
+            c.feeLocker,
+            c.weth,
+            ...(pairedInfra
+              ? [pairedInfra.locker as Address, pairedInfra.feeLocker]
+              : []),
+          ].map((x) => getAddress(x)),
         );
         let policyType: number;
         let accounts: Address[];
