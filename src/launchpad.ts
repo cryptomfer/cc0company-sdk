@@ -20,6 +20,7 @@ import {
   CC0_CONTRACTS,
   CHAIN_IDS,
   DEFAULT_RPCS,
+  PAIRED_SPLIT,
   PROTOCOL_SPLIT,
   toChainSlug,
   VAULT_MIN_LOCKUP_SECONDS,
@@ -39,6 +40,11 @@ import {
 // A config that drops or resizes the protocol slices reverts with Cc0InvalidProtocolSplit.
 // The two protocol slice addresses + their admin are read live from the factory, so this
 // SDK keeps working if the platform ever rotates them (e.g. a staking v2).
+//
+// PAIRED LAUNCHES (custom pair): pass `pairedToken` to pair the pool with an arbitrary
+// ERC-20 instead of WETH. The factory then enforces an 80/20 creator/treasury split —
+// no staking slice (staking rewards are WETH-only; a paired-token slice would strand in
+// the fee locker) — and BOTH slices take fees in BOTH pool tokens. Base-only for now.
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 // Pool constants (must mirror the launchpad's canonical pool shape).
@@ -84,6 +90,83 @@ export function startingTickForSupply(preset: Cc0LpPreset, supplyWhole: number):
   return tick;
 }
 
+/**
+ * Starting tick for a PAIRED launch (pool quoted in an arbitrary ERC-20, not WETH).
+ * A paired pool prices the new token in the PAIRED token, so the preset's fixed tick
+ * (a WETH price) is meaningless — the tick is recomputed at launch time from the paired
+ * token's live WETH price + decimals so the preset's FDV target (in WETH) still holds.
+ * Identity invariant: pairedPriceWeth=1, pairedDecimals=18, default supply → the
+ * preset's base tick exactly. Result is a multiple of TICK_SPACING, clamped to range.
+ * Fail-closed: throws when the paired price is missing — NEVER defaults.
+ */
+export function startingTickForPairedLaunch(opts: {
+  preset: Cc0LpPreset;            // 'classic' | 'degen'
+  supplyWhole: number;            // launched-token supply in whole tokens
+  pairedPriceWeth: number;        // live price of the paired token, in WETH
+  pairedDecimals: number;         // paired token decimals (NOT always 18)
+}): number {
+  const { preset, supplyWhole, pairedPriceWeth, pairedDecimals } = opts;
+  if (!Number.isFinite(pairedPriceWeth) || pairedPriceWeth <= 0)
+    throw new Error('Paired token price unavailable'); // fail-closed, NEVER default
+  const s = Number.isFinite(supplyWhole) && supplyWhole > 0 ? supplyWhole : DEFAULT_SUPPLY_WHOLE;
+  // The preset's FDV target in WETH, derived from its own tick (single source of truth):
+  const fdvWeth = Math.pow(1.0001, LP_PRESETS[preset].startingTick) * DEFAULT_SUPPLY_WHOLE;
+  // classic ≈ 9.9 WETH, degen ≈ 1.3 WETH
+  const pricePerTokenInPaired = fdvWeth / pairedPriceWeth / s;      // human units
+  const raw = pricePerTokenInPaired * Math.pow(10, pairedDecimals - 18); // raw token1-per-token0
+  const spacing = TICK_SPACING; // 200
+  let tick = Math.round(Math.log(raw) / Math.log(1.0001) / spacing) * spacing;
+  if (tick > 887000) tick = 887000;
+  if (tick < -887200) tick = -887200;
+  return tick;
+}
+
+/** Implied launch FDV (in WETH) at a given tick — the preview + clamp-guard companion
+ *  to {startingTickForPairedLaunch}. */
+export function impliedFdvWethAtTick(
+  tick: number,
+  supplyWhole: number,
+  pairedPriceWeth: number,
+  pairedDecimals: number,
+): number {
+  const raw = Math.pow(1.0001, tick);
+  const pricePerTokenInPaired = raw * Math.pow(10, 18 - pairedDecimals);
+  return pricePerTokenInPaired * pairedPriceWeth * supplyWhole;
+}
+
+/**
+ * Compute the paired-launch starting tick AND enforce the [0.5, 2] implied-FDV guard:
+ * tick-range clamping (extreme paired prices/decimals) can silently over- OR under-shoot
+ * the preset's FDV target — outside the window the launch throws instead of deploying a
+ * broken pool. (Checking |ratio − 1| does NOT work: undershoot caps at 1.)
+ * Shared by the ERC-20 + B20 launch builders.
+ */
+export function guardedPairedStartingTick(
+  preset: Cc0LpPreset,
+  supplyWhole: number,
+  paired: PairedTokenOption,
+): number {
+  const tick = startingTickForPairedLaunch({
+    preset,
+    supplyWhole,
+    pairedPriceWeth: paired.priceWeth,
+    pairedDecimals: paired.decimals,
+  });
+  const s = Number.isFinite(supplyWhole) && supplyWhole > 0 ? supplyWhole : DEFAULT_SUPPLY_WHOLE;
+  const targetFdvWeth = Math.pow(1.0001, LP_PRESETS[preset].startingTick) * DEFAULT_SUPPLY_WHOLE;
+  const ratio = impliedFdvWethAtTick(tick, s, paired.priceWeth, paired.decimals) / targetFdvWeth;
+  if (!(ratio >= 0.5 && ratio <= 2)) {
+    throw new Error(
+      `Paired launch blocked: at the computed starting tick the implied FDV lands ${
+        ratio < 0.5 ? 'below half' : 'more than double'
+      } the '${preset}' preset target — the paired token's price/decimals push the pool ` +
+        'outside the supported tick range. Check pairedToken.priceWeth (price of ONE whole ' +
+        'paired token in WETH), or pick a different pair.',
+    );
+  }
+  return tick;
+}
+
 // Locker FeeIn enum: Both=0, Paired=1, Clanker(token)=2.
 const FEE_IN = { both: 0, paired: 1, token: 2 } as const;
 
@@ -102,6 +185,30 @@ const DYNAMIC_3_CONFIG = {
 } as const;
 
 // ─── Params ──────────────────────────────────────────────────────────────────
+
+/**
+ * Paired-launch input: the ERC-20 to pair the pool with instead of WETH.
+ * symbol/decimals are always read on-chain from the address; the WETH price
+ * resolves live from the cc0.company price API unless `priceWeth` is passed.
+ */
+export interface PairedTokenParam {
+  address: Address;
+  /**
+   * Price of ONE whole paired token in WETH. Explicit value wins; when omitted the
+   * SDK resolves it from the cc0.company price API (paired USD ÷ ETH/USD). The launch
+   * THROWS when neither resolves — fail-closed, never a default.
+   */
+  priceWeth?: number;
+}
+
+/** A fully-resolved paired token (symbol/decimals from the chain, price live). */
+export interface PairedTokenOption {
+  address: Address;
+  symbol: string;
+  decimals: number;
+  /** Live price of ONE whole paired token in WETH. Resolver: form/server/SDK. Fail-closed. */
+  priceWeth: number;
+}
 
 export interface CreatorRewardSlice {
   /** Wallet receiving this share of the creator fees. */
@@ -177,6 +284,16 @@ export interface LaunchTokenParams {
    * (~$5k starting FDV, thin: the price needs ~7× less volume to move). See LP_PRESETS.
    */
   lpPreset?: Cc0LpPreset;
+  /**
+   * PAIRED LAUNCH — pair the pool with this ERC-20 instead of WETH. The fee split
+   * becomes 80% you / 20% treasury (no staker slice — staking rewards are WETH-only)
+   * and both slices take fees in BOTH pool tokens. symbol/decimals are read on-chain;
+   * the WETH price resolves from the cc0.company price API unless `priceWeth` is set
+   * (fail-closed: no price, no launch). Base-only; dev buy + creatorRewards +
+   * nftCollection are not available for paired launches yet. undefined ⇒ standard
+   * WETH launch (unchanged 75/15/10 path).
+   */
+  pairedToken?: PairedTokenParam;
   /** Custom salt; random if omitted. */
   salt?: Hex;
   /**
@@ -227,6 +344,9 @@ export interface PreparedTransaction {
 export interface PreparedLaunchTransaction extends PreparedTransaction {
   /** The ipfs:// URI that was written into the token config (already pinned). */
   imageUri: string;
+  /** Paired launches only: the fully-resolved paired token (symbol/decimals/price) —
+   *  pass it to registerLaunch so the token page records the pairing. */
+  pairedToken?: PairedTokenOption;
 }
 
 /**
@@ -552,6 +672,11 @@ export class Cc0Launchpad {
    * Either way: image pinned to IPFS, gas handled, token page live on cc0.company.
    */
   async launchToken(p: LaunchTokenParams): Promise<LaunchTokenResult> {
+    // Paired launches route the FULL 80% to one wallet — the distributor split doesn't
+    // apply. Checked BEFORE the distributor deploy so no transaction is wasted.
+    if (p.nftCollection && p.pairedToken) {
+      throw new Error('NFT-collection fee routing is not available for paired launches yet.');
+    }
     // Option B — deploy a per-token NFT fee distributor (extra tx via the configured signer) and
     // route the FULL 75% to it as the sole creator slice (feePreference 'both' → holders earn WETH
     // + the launched token; admin = the distributor → the slice is frozen, trustless).
@@ -577,7 +702,10 @@ export class Cc0Launchpad {
       if (!account) throw new Error('walletClient has no account attached.');
       const creator = account.address as Address;
 
-      const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(effective, creator);
+      const { config, totalMsgValue, imageUri, paired } = await this.buildDeploymentConfig(
+        effective,
+        creator,
+      );
 
       const txHash = await this.walletClient.writeContract({
         account,
@@ -594,6 +722,7 @@ export class Cc0Launchpad {
         params: p,
         creator,
         imageUri,
+        paired,
         nftDistributor,
         nftCollection: nftCollectionAddr,
       });
@@ -612,6 +741,7 @@ export class Cc0Launchpad {
         params: p,
         creator,
         imageUri: prepared.imageUri,
+        paired: prepared.pairedToken,
         nftDistributor,
         nftCollection: nftCollectionAddr,
       });
@@ -704,6 +834,8 @@ export class Cc0Launchpad {
     creator: Address;
     /** The resolved ipfs:// URI (from PreparedLaunchTransaction.imageUri). */
     imageUri?: string;
+    /** Paired launches: the resolved paired token (from PreparedLaunchTransaction.pairedToken). */
+    paired?: PairedTokenOption;
     /** Option B: the deployed per-token NFT fee distributor + its linked collection, recorded so
      *  the token page / NFT-detail / /rewards surfaces can find it. */
     nftDistributor?: Address;
@@ -733,6 +865,7 @@ export class Cc0Launchpad {
         creator: args.creator,
         hasAirdrop: !!args.params.airdrop,
         lpPreset: args.params.lpPreset,
+        paired: args.paired,
         nftFeeDistributor: args.nftDistributor,
         nftFeeCollection: args.nftCollection,
       });
@@ -755,7 +888,10 @@ export class Cc0Launchpad {
     p: LaunchTokenParams,
     opts: { creator: Address },
   ): Promise<PreparedLaunchTransaction> {
-    const { config, totalMsgValue, imageUri } = await this.buildDeploymentConfig(p, opts.creator);
+    const { config, totalMsgValue, imageUri, paired } = await this.buildDeploymentConfig(
+      p,
+      opts.creator,
+    );
     const to = this.contracts.FACTORY;
     const data = encodeFunctionData({
       abi: FACTORY_ABI,
@@ -784,7 +920,11 @@ export class Cc0Launchpad {
     // without them ("Malformed unsigned EIP-1559 transaction").
     const fees = await estimateEip1559Fees(this.publicClient);
 
-    return { ...toPreparedTx(to, data, totalMsgValue, gas, fees, this.chainId), imageUri };
+    return {
+      ...toPreparedTx(to, data, totalMsgValue, gas, fees, this.chainId),
+      imageUri,
+      pairedToken: paired,
+    };
   }
 
   /**
@@ -803,6 +943,9 @@ export class Cc0Launchpad {
     hasAirdrop?: boolean;
     /** Liquidity profile the launch used — recorded for the token page badge. */
     lpPreset?: Cc0LpPreset;
+    /** Paired launch: the resolved paired token — recorded so the token page shows the
+     *  "Paired with $SYM" badge, the 80/20 split, and the paired claim assets. */
+    paired?: { address: Address; symbol: string; decimals: number };
     /** Option B: the per-token NFT fee distributor + the collection whose holders earn. */
     nftFeeDistributor?: Address;
     nftFeeCollection?: Address;
@@ -823,6 +966,14 @@ export class Cc0Launchpad {
           creator_wallet: params.creator,
           has_airdrop: !!params.hasAirdrop,
           ...(params.lpPreset ? { lp_preset: params.lpPreset } : {}),
+          ...(params.paired
+            ? {
+                paired_token: params.paired.address.toLowerCase(),
+                paired_symbol: params.paired.symbol,
+                paired_decimals: params.paired.decimals,
+                split_type: 'paired',
+              }
+            : {}),
           ...(params.nftFeeDistributor && params.nftFeeCollection
             ? {
                 nft_fee_distributor: params.nftFeeDistributor,
@@ -844,7 +995,12 @@ export class Cc0Launchpad {
   private async buildDeploymentConfig(
     p: LaunchTokenParams,
     creator: Address,
-  ): Promise<{ config: Record<string, unknown>; totalMsgValue: bigint; imageUri: string }> {
+  ): Promise<{
+    config: Record<string, unknown>;
+    totalMsgValue: bigint;
+    imageUri: string;
+    paired?: PairedTokenOption;
+  }> {
     const c = this.contracts;
 
     // Liquidity profile → starting tick (⇒ starting FDV ⇒ depth). Fail on unknown
@@ -855,50 +1011,87 @@ export class Cc0Launchpad {
         `Unknown lpPreset "${lpPreset}" — use one of: ${Object.keys(LP_PRESETS).join(', ')}.`,
       );
     }
-    const startingTick = LP_PRESETS[lpPreset].startingTick;
+
+    // ── Paired launch (custom pair) — validate + resolve BEFORE any side effect ──
+    // Pairing swaps the pool's quote asset from WETH to an arbitrary ERC-20: the fee
+    // split becomes the two-slice 80/20 (creator/treasury, no staking — staking rewards
+    // are WETH-only) and BOTH slices take fees in BOTH pool tokens.
+    let paired: PairedTokenOption | undefined;
+    if (p.pairedToken) {
+      if (this.chainSlug !== 'base') {
+        throw new Error(
+          'Paired launches are Base-only for now — construct the launchpad with chain: "base".',
+        );
+      }
+      if (p.devBuyEth && Number(p.devBuyEth) > 0) {
+        throw new Error('Dev buy is not available for paired launches yet.');
+      }
+      if (p.creatorRewards && p.creatorRewards.length > 0) {
+        throw new Error(
+          'creatorRewards splits are not available for paired launches yet — the full 80% creator slice goes to the deployer.',
+        );
+      }
+      paired = await resolvePairedToken(p.pairedToken, {
+        publicClient: this.publicClient,
+        registryUrl: this.registryUrl,
+        weth: c.WETH,
+      });
+    }
+
+    // Paired pools are priced in the PAIRED token, so the preset tick (a WETH price)
+    // is recomputed from the live paired price; the [0.5, 2] implied-FDV guard throws
+    // when tick clamping would deploy a broken pool.
+    const startingTick = paired
+      ? guardedPairedStartingTick(lpPreset, DEFAULT_SUPPLY_WHOLE, paired)
+      : LP_PRESETS[lpPreset].startingTick;
 
     // Pin the image FIRST — its URI goes on-chain forever, so permanence is
     // guaranteed before any transaction is built (fail-closed by default).
     const imageUri = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
 
     // ── Creator slices (their 75%, splittable) ────────────────────────────────
+    // Paired launches skip the 7500-sum validation: the split is the pinned
+    // two-slice 80/20 and creatorSlices collapses to the single default slice
+    // (still referenced below as the vault/airdrop/dev-buy admin).
     const creatorSlices: CreatorRewardSlice[] =
       p.creatorRewards && p.creatorRewards.length > 0
         ? p.creatorRewards
         : [{ recipient: creator, bps: PROTOCOL_SPLIT.CREATOR_BPS, feePreference: 'both' }];
-    if (creatorSlices.length > 5) {
-      throw new Error('At most 5 creator reward slices (7 total with the protocol slices).');
-    }
-    const creatorTotal = creatorSlices.reduce((s, r) => s + r.bps, 0);
-    if (creatorTotal !== PROTOCOL_SPLIT.CREATOR_BPS) {
-      throw new Error(
-        `creatorRewards bps must sum to exactly ${PROTOCOL_SPLIT.CREATOR_BPS} (got ${creatorTotal}).`,
-      );
+    if (!paired) {
+      if (creatorSlices.length > 5) {
+        throw new Error('At most 5 creator reward slices (7 total with the protocol slices).');
+      }
+      const creatorTotal = creatorSlices.reduce((s, r) => s + r.bps, 0);
+      if (creatorTotal !== PROTOCOL_SPLIT.CREATOR_BPS) {
+        throw new Error(
+          `creatorRewards bps must sum to exactly ${PROTOCOL_SPLIT.CREATOR_BPS} (got ${creatorTotal}).`,
+        );
+      }
     }
 
     // ── Enforced protocol slices, read live from the factory ──────────────────
     const protocol = await this.getProtocolAddresses();
 
-    const rewardRecipients = [
-      ...creatorSlices.map((s) => s.recipient),
-      protocol.staking,
-      protocol.treasury,
-    ];
-    const rewardAdmins = [
-      ...creatorSlices.map((s) => s.recipient), // each creator slice administers itself
-      protocol.admin,
-      protocol.admin,
-    ];
-    const rewardBps = [
-      ...creatorSlices.map((s) => s.bps),
-      PROTOCOL_SPLIT.STAKING_BPS,
-      PROTOCOL_SPLIT.TREASURY_BPS,
-    ];
-    const feePreference = [
-      ...creatorSlices.map((s) => FEE_IN[s.feePreference ?? 'both']),
-      FEE_IN.paired, // staking — WETH only, enforced
-      FEE_IN.paired, // treasury — WETH only, enforced
-    ];
+    const rewardRecipients = paired
+      ? [creator, protocol.treasury]
+      : [...creatorSlices.map((s) => s.recipient), protocol.staking, protocol.treasury];
+    const rewardAdmins = paired
+      ? [creator, protocol.admin]
+      : [
+          ...creatorSlices.map((s) => s.recipient), // each creator slice administers itself
+          protocol.admin,
+          protocol.admin,
+        ];
+    const rewardBps = paired
+      ? [PAIRED_SPLIT.CREATOR_BPS, PAIRED_SPLIT.TREASURY_BPS]
+      : [...creatorSlices.map((s) => s.bps), PROTOCOL_SPLIT.STAKING_BPS, PROTOCOL_SPLIT.TREASURY_BPS];
+    const feePreference = paired
+      ? [FEE_IN.both, FEE_IN.both] // neither pool token is assumed WETH-liquid — fees in BOTH
+      : [
+          ...creatorSlices.map((s) => FEE_IN[s.feePreference ?? 'both']),
+          FEE_IN.paired, // staking — WETH only, enforced
+          FEE_IN.paired, // treasury — WETH only, enforced
+        ];
 
     // ── Fee hook + feeData ────────────────────────────────────────────────────
     const feeMode = p.feeMode ?? 'static';
@@ -1109,7 +1302,7 @@ export class Cc0Launchpad {
       },
       poolConfig: {
         hook,
-        pairedToken: c.WETH,
+        pairedToken: paired ? paired.address : c.WETH,
         tickIfToken0IsClanker: startingTick,
         tickSpacing: TICK_SPACING,
         poolData,
@@ -1128,7 +1321,7 @@ export class Cc0Launchpad {
       extensionConfigs: extensions,
     };
 
-    return { config, totalMsgValue, imageUri };
+    return { config, totalMsgValue, imageUri, paired };
   }
 }
 
@@ -1180,6 +1373,103 @@ export async function estimateEip1559Fees(
     /* fall through */
   }
   return undefined;
+}
+
+// ─── Paired-token resolution (shared by the ERC-20 + B20 launch builders) ───
+
+const ERC20_METADATA_ABI = [
+  { type: 'function', name: 'symbol', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
+  { type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
+] as const;
+
+/**
+ * Resolve a PairedTokenParam into the full PairedTokenOption the launch builders need:
+ *   • symbol + decimals — ALWAYS read on-chain from the address (never trusted).
+ *   • priceWeth — explicit param wins; otherwise the cc0.company price API resolves the
+ *     paired token's USD price ÷ WETH's USD price (same registry the SDK registers
+ *     launches on). FAIL-CLOSED: no resolvable price ⇒ throw, never a default —
+ *     a guessed price mis-ticks the pool and one small buy can drain it.
+ */
+export async function resolvePairedToken(
+  input: PairedTokenParam,
+  opts: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any;
+    /** cc0.company base URL (the instance's registryUrl). */
+    registryUrl: string;
+    /** The chain's canonical WETH — pairing with it is just the standard launch. */
+    weth: Address;
+  },
+): Promise<PairedTokenOption> {
+  const address = input.address;
+  if (typeof address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new Error(`pairedToken.address is not a valid ERC-20 address (got: ${String(address)}).`);
+  }
+  if (address.toLowerCase() === opts.weth.toLowerCase()) {
+    throw new Error('pairedToken is WETH — that IS the standard launch; omit pairedToken.');
+  }
+
+  // symbol()/decimals() straight from the chain — any ERC-20 qualifies IF both resolve.
+  let symbol: string;
+  let decimals: number;
+  try {
+    const [sym, dec] = await Promise.all([
+      opts.publicClient.readContract({ address, abi: ERC20_METADATA_ABI, functionName: 'symbol' }),
+      opts.publicClient.readContract({ address, abi: ERC20_METADATA_ABI, functionName: 'decimals' }),
+    ]);
+    symbol = String(sym);
+    decimals = Number(dec);
+  } catch {
+    throw new Error(
+      `Could not read symbol()/decimals() from ${address} — is it an ERC-20 on this chain? ` +
+        'Paired launches require both (fail-closed).',
+    );
+  }
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
+    throw new Error(`Paired token ${address} reports unusable decimals (${decimals}).`);
+  }
+
+  // Explicit price wins — but an explicitly-invalid one still fails closed.
+  if (input.priceWeth !== undefined) {
+    if (!Number.isFinite(input.priceWeth) || input.priceWeth <= 0) {
+      throw new Error(
+        'pairedToken.priceWeth must be a positive number (the price of ONE whole paired token in WETH).',
+      );
+    }
+    return { address, symbol, decimals, priceWeth: input.priceWeth };
+  }
+
+  // Live resolution: paired USD ÷ WETH USD from the cc0.company price API — the same
+  // API family the SDK already uses to register launches. `types=cc0strategy` routes
+  // the paired token through the on-chain V4 spot probe (instant for launchpad tokens)
+  // with GeckoTerminal as its fallback; WETH resolves via the standard path.
+  let priceWeth = 0;
+  try {
+    const url =
+      `${opts.registryUrl}/api/store/token-prices` +
+      `?addresses=${address},${opts.weth}&types=cc0strategy,external&chains=base,base&holders=0`;
+    const res = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
+    });
+    const json = res.ok ? await res.json().catch(() => null) : null;
+    const prices = (json?.prices ?? {}) as Record<string, { price_usd?: number }>;
+    const pairedUsd = Number(prices[address.toLowerCase()]?.price_usd ?? 0);
+    const wethUsd = Number(prices[opts.weth.toLowerCase()]?.price_usd ?? 0);
+    if (Number.isFinite(pairedUsd) && pairedUsd > 0 && Number.isFinite(wethUsd) && wethUsd > 0) {
+      priceWeth = pairedUsd / wethUsd;
+    }
+  } catch {
+    /* fall through to the fail-closed throw */
+  }
+  if (!Number.isFinite(priceWeth) || priceWeth <= 0) {
+    throw new Error(
+      `Could not resolve the ${symbol} (${address}) price in WETH from the cc0.company price API — ` +
+        'pass pairedToken.priceWeth explicitly, or launch a standard WETH pair. ' +
+        'Paired launches fail closed: no price, no launch.',
+    );
+  }
+  return { address, symbol, decimals, priceWeth };
 }
 
 /** Reject non-hashes EARLY with an actionable message instead of hanging on a

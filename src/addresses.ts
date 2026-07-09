@@ -146,6 +146,19 @@ export const PROTOCOL_SPLIT = {
   TREASURY_BPS: 1000,
 } as const;
 
+/**
+ * The PAIRED-launch fee split (pool paired with an arbitrary ERC-20 instead of WETH),
+ * enforced on-chain by the factory: 80% creator / 20% treasury — NO staking slice
+ * (staking rewards are WETH-only; a paired-token slice would strand in the fee locker).
+ * Both slices take fees in BOTH pool tokens.
+ */
+export const PAIRED_SPLIT = {
+  /** Creator's share of LP fees for paired launches, in basis points. */
+  CREATOR_BPS: 8000,
+  /** cc0.company treasury share for paired launches — enforced on-chain. */
+  TREASURY_BPS: 2000,
+} as const;
+
 /** On-chain extension minimums (from the vault / airdrop contracts). */
 export const VAULT_MIN_LOCKUP_SECONDS = 7 * 86400; // 7 days
 export const AIRDROP_MIN_LOCKUP_SECONDS = 86400; // 1 day

@@ -2,7 +2,8 @@
 // @cc0company/sdk — the official cc0.company SDK.
 //
 //   • Cc0Launchpad    — launch tokens with the on-chain enforced 75/15/10 fee split
-//   • Cc0B20Launchpad — launch tradeable B20s (Base-native standard), same split
+//                       (or pair with any ERC-20 instead of WETH — 80/20 paired launches)
+//   • Cc0B20Launchpad — launch tradeable B20s (Base-native standard), same splits
 //   • Cc0Fees         — read + claim creator trading fees
 //   • Cc0Staking      — stake $cc0company, earn WETH from every launch
 //   • Cc0Drops        — deploy, manage + mint IPFS NFT drops (CC0Drop 721 / 1155)
@@ -17,6 +18,9 @@ export {
   LP_PRESETS,
   DEFAULT_SUPPLY_WHOLE,
   startingTickForSupply,
+  startingTickForPairedLaunch,
+  impliedFdvWethAtTick,
+  resolvePairedToken,
   parseLaunchReceipt,
   toPreparedTx,
   estimateEip1559Fees,
@@ -29,6 +33,8 @@ export type {
   LaunchTokenParams,
   LaunchTokenResult,
   LaunchImage,
+  PairedTokenOption,
+  PairedTokenParam,
   PreparedTransaction,
   PreparedLaunchTransaction,
   CreatorRewardSlice,
@@ -95,6 +101,7 @@ export {
   CC0_CONTRACTS,
   CHAIN_IDS,
   DEFAULT_RPCS,
+  PAIRED_SPLIT,
   PROTOCOL_SPLIT,
   robinhoodChain,
   toChainSlug,

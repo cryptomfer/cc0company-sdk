@@ -21,6 +21,8 @@ import {
   Cc0Launchpad,
   FACTORY_ABI,
   LP_PRESETS,
+  guardedPairedStartingTick,
+  resolvePairedToken,
   startingTickForSupply,
   assertTxHash,
   estimateEip1559Fees,
@@ -29,9 +31,11 @@ import {
   type Cc0LpPreset,
   type ExternalSender,
   type LaunchImage,
+  type PairedTokenOption,
+  type PairedTokenParam,
   type PreparedTransaction,
 } from './launchpad';
-import { PROTOCOL_SPLIT } from './addresses';
+import { PAIRED_SPLIT, PROTOCOL_SPLIT } from './addresses';
 
 // ═══════════════════════════════════════════════════════════════════════════════════
 // B20 LAUNCHPAD — launch a TRADEABLE B20 (Base's native token standard) through the
@@ -46,9 +50,13 @@ import { PROTOCOL_SPLIT } from './addresses';
 //     the optional `b20` config (supply cap, roles, compliance, freeze) is applied
 //     right after launch as follow-up transactions.
 //
-// FAIL-CLOSED availability: the launchpad is live on Base Sepolia; the Base-mainnet
-// entry ships pre-staged with an empty factory until the audited mainnet cutover.
-// Constructing against a chain whose factory isn't set throws immediately.
+// PAIRED LAUNCHES (custom pair): pass `pairedToken` to pair the pool with an arbitrary
+// ERC-20 instead of WETH — the factory then enforces an 80/20 creator/treasury split
+// (no staking slice; staking rewards are WETH-only) with fees taken in BOTH pool tokens.
+//
+// FAIL-CLOSED availability: the launchpad is live on Base mainnet (8453, default) and
+// Base Sepolia (84532). Constructing against a chain whose factory isn't set throws
+// immediately.
 // ═══════════════════════════════════════════════════════════════════════════════════
 
 /** The launchpad B20 is ASSET / 18 decimals; empty supply = the 100B default. */
@@ -310,6 +318,15 @@ export interface LaunchB20Params {
    * the dollar figures proportionally; degen stays ~7× thinner either way.
    */
   lpPreset?: Cc0LpPreset;
+  /**
+   * PAIRED LAUNCH — pair the pool with this ERC-20 instead of WETH. The fee split
+   * becomes 80% you / 20% treasury (no staker slice — staking rewards are WETH-only)
+   * and both slices take fees in BOTH pool tokens. symbol/decimals are read on-chain;
+   * the WETH price resolves from the cc0.company price API unless `priceWeth` is set
+   * (fail-closed: no price, no launch — on Sepolia pass it explicitly). Dev buy is not
+   * available for paired launches. undefined ⇒ standard WETH launch (75/15/10 path).
+   */
+  pairedToken?: PairedTokenParam;
   socials?: string[];
   /** Wallet receiving the creator's 75% slice + vault/dev-buy proceeds. Defaults to the creator. */
   rewardRecipient?: Address;
@@ -450,7 +467,10 @@ export class Cc0B20Launchpad {
    */
   async launchB20(p: LaunchB20Params): Promise<LaunchB20Result> {
     const creator = await this.resolveCreator();
-    const { config, totalMsgValue, supplyBaseUnits } = await this.buildDeploymentConfig(p, creator);
+    const { config, totalMsgValue, supplyBaseUnits, paired } = await this.buildDeploymentConfig(
+      p,
+      creator,
+    );
 
     const data = encodeFunctionData({
       abi: B20_FACTORY_ABI,
@@ -487,6 +507,7 @@ export class Cc0B20Launchpad {
         creator,
         hasAirdrop: !!p.airdrop,
         lpPreset: p.lpPreset,
+        paired,
       });
     }
 
@@ -509,6 +530,9 @@ export class Cc0B20Launchpad {
     creator: Address;
     hasAirdrop?: boolean;
     lpPreset?: Cc0LpPreset;
+    /** Paired launch: the resolved paired token — recorded so the token page shows the
+     *  "Paired with $SYM" badge, the 80/20 split, and the paired claim assets. */
+    paired?: { address: Address; symbol: string; decimals: number };
   }): Promise<boolean> {
     try {
       const res = await fetch(`${this.registryUrl}/api/store/token-launches`, {
@@ -529,6 +553,14 @@ export class Cc0B20Launchpad {
           creator_wallet: params.creator,
           has_airdrop: !!params.hasAirdrop,
           ...(params.lpPreset ? { lp_preset: params.lpPreset } : {}),
+          ...(params.paired
+            ? {
+                paired_token: params.paired.address.toLowerCase(),
+                paired_symbol: params.paired.symbol,
+                paired_decimals: params.paired.decimals,
+                split_type: 'paired',
+              }
+            : {}),
         }),
         signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
       });
@@ -593,7 +625,12 @@ export class Cc0B20Launchpad {
   private async buildDeploymentConfig(
     p: LaunchB20Params,
     creator: Address,
-  ): Promise<{ config: Record<string, unknown>; totalMsgValue: bigint; supplyBaseUnits: bigint }> {
+  ): Promise<{
+    config: Record<string, unknown>;
+    totalMsgValue: bigint;
+    supplyBaseUnits: bigint;
+    paired?: PairedTokenOption;
+  }> {
     const c = this.contracts;
 
     const lpPreset = p.lpPreset ?? 'classic';
@@ -601,6 +638,21 @@ export class Cc0B20Launchpad {
       throw new Error(
         `Unknown lpPreset "${lpPreset}" — use one of: ${Object.keys(LP_PRESETS).join(', ')}.`,
       );
+    }
+
+    // ── Paired launch (custom pair) — validate + resolve BEFORE any side effect ──
+    // symbol/decimals read on-chain; priceWeth explicit or resolved live from the
+    // cc0.company price API (fail-closed — no price, no launch).
+    let paired: PairedTokenOption | undefined;
+    if (p.pairedToken) {
+      if (p.devBuyEth && Number(p.devBuyEth) > 0) {
+        throw new Error('Dev buy is not available for paired launches yet.');
+      }
+      paired = await resolvePairedToken(p.pairedToken, {
+        publicClient: this.publicClient,
+        registryUrl: this.registryUrl,
+        weth: c.weth,
+      });
     }
 
     // Pin the image FIRST — the URI goes on-chain forever (fail-closed permanence).
@@ -615,14 +667,15 @@ export class Cc0B20Launchpad {
       p.supply && p.supply.trim() !== ''
         ? parseUnits(p.supply.trim(), B20_LAUNCH_DECIMALS)
         : B20_DEFAULT_LAUNCH_SUPPLY;
+    const supplyWhole = Number(supplyBaseUnits / 10n ** BigInt(B20_LAUNCH_DECIMALS));
 
     // Starting tick ADJUSTED for the supply so the preset's FDV holds — a fixed tick + a tiny custom
-    // supply prices the whole pool at ~$0 and one small buy drains it. Feeds both
-    // tickIfToken0IsClanker AND tickLower[0] below.
-    const startingTick = startingTickForSupply(
-      lpPreset,
-      Number(supplyBaseUnits / 10n ** BigInt(B20_LAUNCH_DECIMALS)),
-    );
+    // supply prices the whole pool at ~$0 and one small buy drains it. Paired pools are priced in
+    // the PAIRED token, so their tick is additionally derived from its live WETH price (with the
+    // [0.5, 2] implied-FDV guard). Feeds both tickIfToken0IsClanker AND tickLower[0] below.
+    const startingTick = paired
+      ? guardedPairedStartingTick(lpPreset, supplyWhole, paired)
+      : startingTickForSupply(lpPreset, supplyWhole);
 
     // ── fee hook + feeData ──
     const feeMode = p.feeMode ?? 'static';
@@ -670,10 +723,17 @@ export class Cc0B20Launchpad {
       }],
       [{ extension: ZERO, extensionData: '0x', feeData }],
     );
-    // creator → Both (WETH + token); staking + treasury → Paired (WETH only).
+    // Standard: creator → Both (WETH + token); staking + treasury → Paired (WETH only).
+    // Paired launch: BOTH slices → Both — neither pool token is assumed WETH-liquid.
     const lockerData = encodeAbiParameters(
       [{ type: 'tuple', components: [{ name: 'feePreference', type: 'uint8[]' }] }],
-      [{ feePreference: [FEE_IN.both, FEE_IN.paired, FEE_IN.paired] }],
+      [
+        {
+          feePreference: paired
+            ? [FEE_IN.both, FEE_IN.both]
+            : [FEE_IN.both, FEE_IN.paired, FEE_IN.paired],
+        },
+      ],
     );
 
     // ── MEV protection ──
@@ -804,16 +864,22 @@ export class Cc0B20Launchpad {
       },
       poolConfig: {
         hook,
-        pairedToken: c.weth,
+        pairedToken: paired ? paired.address : c.weth,
         tickIfToken0IsClanker: startingTick,
         tickSpacing: TICK_SPACING,
         poolData,
       },
       lockerConfig: {
         locker: c.locker,
-        rewardAdmins: [creator, enforced.admin, enforced.admin],
-        rewardRecipients: [rewardRecipient, enforced.staking, enforced.treasury],
-        rewardBps: [PROTOCOL_SPLIT.CREATOR_BPS, PROTOCOL_SPLIT.STAKING_BPS, PROTOCOL_SPLIT.TREASURY_BPS],
+        rewardAdmins: paired
+          ? [creator, enforced.admin]
+          : [creator, enforced.admin, enforced.admin],
+        rewardRecipients: paired
+          ? [rewardRecipient, enforced.treasury]
+          : [rewardRecipient, enforced.staking, enforced.treasury],
+        rewardBps: paired
+          ? [PAIRED_SPLIT.CREATOR_BPS, PAIRED_SPLIT.TREASURY_BPS]
+          : [PROTOCOL_SPLIT.CREATOR_BPS, PROTOCOL_SPLIT.STAKING_BPS, PROTOCOL_SPLIT.TREASURY_BPS],
         tickLower: [startingTick],
         tickUpper: [MAX_TICK_UPPER],
         positionBps: [10_000],
@@ -823,7 +889,7 @@ export class Cc0B20Launchpad {
       extensionConfigs: extensions,
     };
 
-    return { config, totalMsgValue, supplyBaseUnits };
+    return { config, totalMsgValue, supplyBaseUnits, paired };
   }
 
   /** Apply the managed B20-native config to the live token. Each step is fail-soft. */
