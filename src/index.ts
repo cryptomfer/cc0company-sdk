@@ -73,7 +73,7 @@ export type {
 
 // Creator fees
 export { Cc0Fees } from './fees';
-export type { ClaimableFees, ClaimFeesResult } from './fees';
+export type { ClaimableFees, ClaimFeesResult, FeeAssetOpts } from './fees';
 
 // Staking
 export { Cc0Staking } from './staking';
