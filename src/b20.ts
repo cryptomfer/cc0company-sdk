@@ -451,6 +451,51 @@ export interface LaunchB20Result {
   configWarnings?: string[];
 }
 
+/**
+ * Params for a GAS-SPONSORED B20 launch (`launchB20Sponsored`) — the platform pays
+ * the deploy gas; the caller signs nothing and needs no ETH. No dev buy, per-wallet
+ * daily cap. Probe `sponsorshipStatus()` first and fall back to `launchB20()` when
+ * inactive. Managed post-launch config is NOT applied by the sponsor (the creator
+ * is DEFAULT_ADMIN — finish from the dashboard); trustless launches need nothing.
+ */
+export interface SponsoredB20LaunchParams {
+  name: string;
+  symbol: string;
+  /** URL / ipfs:// used as-is (or pinned per imagePolicy); raw bytes/Blob are pinned first. */
+  image: LaunchImage;
+  /** 'pin' (default) guarantees IPFS permanence; 'as-is' trusts a URL string. */
+  imagePolicy?: 'pin' | 'as-is';
+  description?: string;
+  /** Launch supply, WHOLE tokens (e.g. "420"). Empty ⇒ the 100B default. */
+  supply?: string;
+  feeMode?: 'static' | 'dynamic';
+  feeTier?: 1 | 2 | 3 | 6.9;
+  sniperTax?: { startingBps: number; endingBps: number; secondsToDecay: number };
+  vault?: { percentage: number; lockupSeconds: number; vestingSeconds: number };
+  airdrop?: { merkleRoot: Hex; percentage: number; lockupSeconds?: number; vestingSeconds?: number };
+  lpPreset?: Cc0LpPreset;
+  socials?: string[];
+  /** Defaults to the configured signer's address; REQUIRED when the instance has no signer. */
+  rewardRecipient?: Address;
+  /** 'trustless' (default, server-side too) or 'managed' (the creator becomes DEFAULT_ADMIN). */
+  adminMode?: 'trustless' | 'managed';
+  /** PAIRED launch: pool pairs with this ERC-20/B20; the server resolves the price (fail-closed). */
+  pairedTokenAddress?: Address;
+}
+
+export interface SponsoredB20LaunchResult {
+  tokenAddress: Address;
+  txHash: Hash;
+  sponsored: true;
+  /** Recorded in the cc0.company registry server-side (token page live). */
+  registered: boolean;
+  /** True when adminMode was 'managed' — the creator applies supply cap / roles /
+   *  compliance from the dashboard (the sponsor cannot; it isn't the admin). */
+  managedConfigDeferred?: boolean;
+  pairedToken?: { address: Address; symbol: string; decimals: number };
+  airdropExtension?: Address;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────────────
 
 function randomSalt(): Hex {
@@ -1128,6 +1173,92 @@ export class Cc0B20Launchpad {
         }
       });
     }
+  }
+
+  // ── Gas-sponsored launches (zero ETH, zero signature) ───────────────────────
+
+  /**
+   * Whether the platform will pay the B20 deploy gas right now. `reason` is
+   * 'disabled' (switch off / not deployed) or 'unfunded' (sponsor below its ETH
+   * floor). Probe this first, then `launchB20Sponsored()` — fall back to
+   * `launchB20()` when inactive.
+   */
+  async sponsorshipStatus(): Promise<{ active: boolean; reason?: 'disabled' | 'unfunded' }> {
+    try {
+      const res = await fetch(
+        `${this.registryUrl}/api/b20/sponsor-launch?chainId=${this.chainId}`,
+      );
+      const j = (await res.json().catch(() => ({}))) as {
+        active?: boolean;
+        reason?: 'disabled' | 'unfunded';
+      };
+      return { active: !!j.active, ...(j.reason ? { reason: j.reason } : {}) };
+    } catch {
+      return { active: false, reason: 'disabled' };
+    }
+  }
+
+  /**
+   * GAS-SPONSORED B20 launch — the platform's sponsor wallet signs + pays
+   * `deployToken`; the caller signs NOTHING and needs NO ETH. You keep control
+   * everywhere control exists (`rewardRecipient` gets the creator slice and the
+   * vault/airdrop admin; a managed token's DEFAULT_ADMIN is the creator, never
+   * the sponsor). Registration on cc0.company happens server-side.
+   *
+   * Constraints: no dev buy, per-wallet daily cap (HTTP 429), managed post-launch
+   * config deferred to the dashboard. The image is pinned to IPFS first when raw
+   * bytes/Blob are passed (public endpoint — still no signer needed).
+   */
+  async launchB20Sponsored(p: SponsoredB20LaunchParams): Promise<SponsoredB20LaunchResult> {
+    const rewardRecipient =
+      p.rewardRecipient ??
+      (this.walletClient?.account?.address as Address | undefined) ??
+      this.sender?.address;
+    if (!rewardRecipient) {
+      throw new Error(
+        'rewardRecipient is required for a sponsored launch (no signer configured to default from).',
+      );
+    }
+    const image = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
+    const res = await fetch(`${this.registryUrl}/api/b20/sponsor-launch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chainId: this.chainId,
+        name: p.name,
+        symbol: p.symbol,
+        image,
+        description: p.description,
+        supply: p.supply,
+        feeMode: p.feeMode,
+        feeTier: p.feeTier ?? 1,
+        sniperTax: p.sniperTax,
+        vault: p.vault,
+        airdrop: p.airdrop,
+        lpPreset: p.lpPreset,
+        socials: p.socials,
+        rewardRecipient,
+        ...(p.adminMode ? { adminMode: p.adminMode } : {}),
+        ...(p.pairedTokenAddress ? { pairedTokenAddress: p.pairedTokenAddress } : {}),
+      }),
+    });
+    const j = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok || !j.success) {
+      throw new Error(
+        (j.error as string) || `Sponsored B20 launch failed (HTTP ${res.status}).`,
+      );
+    }
+    return {
+      tokenAddress: j.tokenAddress as Address,
+      txHash: j.txHash as Hash,
+      sponsored: true,
+      registered: !!j.registered,
+      ...(j.managedConfigDeferred ? { managedConfigDeferred: true } : {}),
+      ...(j.pairedToken
+        ? { pairedToken: j.pairedToken as SponsoredB20LaunchResult['pairedToken'] }
+        : {}),
+      ...(j.airdropExtension ? { airdropExtension: j.airdropExtension as Address } : {}),
+    };
   }
 
   /** Resolve any LaunchImage into the on-chain URI, honouring imagePolicy. */

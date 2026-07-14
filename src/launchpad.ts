@@ -321,6 +321,52 @@ export interface LaunchTokenResult {
 }
 
 /**
+ * Params for a GAS-SPONSORED launch (`launchTokenSponsored`) — the platform pays
+ * the deploy gas; the caller signs nothing and needs no ETH. Base + Robinhood
+ * Chain only, no dev buy, per-wallet daily cap. Probe `sponsorshipStatus()` first
+ * and fall back to `launchToken()` when inactive.
+ */
+export interface SponsoredLaunchParams {
+  name: string;
+  symbol: string;
+  /** URL / ipfs:// used as-is (or pinned per imagePolicy); raw bytes/Blob are pinned first. */
+  image: LaunchImage;
+  /** 'pin' (default) guarantees IPFS permanence; 'as-is' trusts a URL string. */
+  imagePolicy?: 'pin' | 'as-is';
+  description?: string;
+  feeMode?: 'static' | 'dynamic';
+  feeTier?: 1 | 2 | 3 | 6.9;
+  sniperTax?: { startingBps: number; endingBps: number; secondsToDecay: number };
+  vault?: { percentage: number; lockupSeconds: number; vestingSeconds: number };
+  airdrop?: { merkleRoot: Hex; percentage: number; lockupSeconds?: number; vestingSeconds?: number };
+  lpPreset?: Cc0LpPreset;
+  socials?: string[];
+  /**
+   * Wallet that receives the creator fee slice + vault/airdrop admin. Defaults to
+   * the configured signer's address; REQUIRED when the instance has no signer
+   * (a sponsored launch itself never needs one).
+   */
+  rewardRecipient?: Address;
+  /** PAIRED launch (Base only): pool pairs with this ERC-20; the server resolves
+   *  symbol/decimals/price itself (fail-closed — a client can never supply a price). */
+  pairedTokenAddress?: Address;
+  /** Option B: route the creator slice to an NFT-holder fee distributor. */
+  nftCollection?: { address: Address; maxEligibleTokenId: string };
+}
+
+export interface SponsoredLaunchResult {
+  tokenAddress: Address;
+  txHash: Hash;
+  sponsored: true;
+  /** Recorded in the cc0.company registry server-side (token page live). `false`
+   *  = registry was unreachable; the token is still fully live on-chain. */
+  registered: boolean;
+  pairedToken?: { address: Address; symbol: string; decimals: number };
+  nftDistributor?: Address;
+  airdropExtension?: Address;
+}
+
+/**
  * An unsigned transaction ready for ANY signer. `json` is the BigInt-free mirror
  * (hex-encoded value/gas) for transports that JSON-serialize (CDP sendTransaction,
  * HTTP relayers, Bankr) — pass it straight through, no serialization gymnastics.
@@ -995,6 +1041,95 @@ export class Cc0Launchpad {
     } catch {
       return false;
     }
+  }
+
+  // ── Gas-sponsored launches (Base + Robinhood — zero ETH, zero signature) ────
+
+  /**
+   * Whether the platform will pay the deploy gas on THIS chain right now.
+   * `reason` is 'disabled' (switch off / not deployed) or 'unfunded' (sponsor
+   * wallet below its ETH floor). Probe this first, then call
+   * `launchTokenSponsored()` — and fall back to `launchToken()` when inactive.
+   */
+  async sponsorshipStatus(): Promise<{ active: boolean; reason?: 'disabled' | 'unfunded' }> {
+    try {
+      const res = await fetch(
+        `${this.registryUrl}/api/cc0strategy/sponsor-launch?chainId=${this.chainId}`,
+      );
+      const j = (await res.json().catch(() => ({}))) as {
+        active?: boolean;
+        reason?: 'disabled' | 'unfunded';
+      };
+      return { active: !!j.active, ...(j.reason ? { reason: j.reason } : {}) };
+    } catch {
+      return { active: false, reason: 'disabled' };
+    }
+  }
+
+  /**
+   * GAS-SPONSORED launch — the platform's sponsor wallet signs + pays
+   * `deployToken`; the caller signs NOTHING and needs NO ETH. You keep control
+   * everywhere control exists: `rewardRecipient` receives the creator fee slice
+   * and is the vault/airdrop admin. Registration on cc0.company happens
+   * server-side (the result carries `registered`).
+   *
+   * Constraints (enforced by the platform):
+   *   • Base (8453) + Robinhood Chain (4663); Ethereum launches are self-paid.
+   *   • No dev buy (it would spend the sponsor's ETH) — use launchToken() for that.
+   *   • Per-wallet daily cap → HTTP 429 (the thrown Error carries the message).
+   *
+   * The image is pinned to IPFS first when raw bytes/Blob are passed (public
+   * endpoint — still no signer needed).
+   */
+  async launchTokenSponsored(p: SponsoredLaunchParams): Promise<SponsoredLaunchResult> {
+    const rewardRecipient =
+      p.rewardRecipient ??
+      (this.walletClient?.account?.address as Address | undefined) ??
+      this.sender?.address;
+    if (!rewardRecipient) {
+      throw new Error(
+        'rewardRecipient is required for a sponsored launch (no signer configured to default from).',
+      );
+    }
+    const image = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
+    const res = await fetch(`${this.registryUrl}/api/cc0strategy/sponsor-launch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chainId: this.chainId,
+        name: p.name,
+        symbol: p.symbol,
+        image,
+        description: p.description,
+        feeMode: p.feeMode,
+        feeTier: p.feeTier ?? 1,
+        sniperTax: p.sniperTax,
+        vault: p.vault,
+        airdrop: p.airdrop,
+        lpPreset: p.lpPreset,
+        socials: p.socials,
+        rewardRecipient,
+        ...(p.pairedTokenAddress ? { pairedTokenAddress: p.pairedTokenAddress } : {}),
+        ...(p.nftCollection ? { nftCollection: p.nftCollection } : {}),
+      }),
+    });
+    const j = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok || !j.success) {
+      throw new Error(
+        (j.error as string) || `Sponsored launch failed (HTTP ${res.status}).`,
+      );
+    }
+    return {
+      tokenAddress: j.tokenAddress as Address,
+      txHash: j.txHash as Hash,
+      sponsored: true,
+      registered: !!j.registered,
+      ...(j.pairedToken
+        ? { pairedToken: j.pairedToken as SponsoredLaunchResult['pairedToken'] }
+        : {}),
+      ...(j.nftDistributor ? { nftDistributor: j.nftDistributor as Address } : {}),
+      ...(j.airdropExtension ? { airdropExtension: j.airdropExtension as Address } : {}),
+    };
   }
 
   // ── Deployment-config assembly (shared by launchToken + prepare) ────────────

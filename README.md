@@ -6,8 +6,7 @@ claim creator fees, and stake $cc0company — from any website, app, or AI agent
 - **`Cc0Launchpad`** — deploy a token on **Base, Ethereum, or Robinhood Chain** in one
   transaction, with the on-chain enforced **75/15/10** fee split: 75% of every trade's
   LP fee to you, 15% to $cc0company stakers, 10% to the platform. Or pair the pool with
-  **any ERC-20 instead of WETH** — an 80/20 paired launch (B20s on Base Sepolia today;
-  Base mainnet pending).
+  **any ERC-20 instead of WETH** — an 80/20 paired launch (LIVE on Base mainnet for both ERC-20s and B20s). New in 1.11.0: gas-sponsored launches, the platform pays the deploy gas on Base + Robinhood Chain (launchTokenSponsored / launchB20Sponsored, zero ETH needed).
 - **`Cc0Fees`** — read and claim your accrued trading fees (WETH + your token), on the
   chain you launched on.
 - **`Cc0Staking`** — stake $cc0company (on Base) and earn WETH from every launch on
@@ -241,6 +240,36 @@ seize right after launch — each step is fail-soft and reported in `configWarni
 Availability is **fail-closed**: Base mainnet (8453) and Base Sepolia (84532) are live;
 constructing against a chain whose factory isn't deployed throws immediately. Works with
 `walletClient`, `account`, or `sender` — exactly like `Cc0Launchpad`.
+
+## Gas-sponsored launches (zero ETH needed)
+
+The platform can pay the deploy gas: the sponsor wallet signs + pays `deployToken`,
+you sign nothing and need no ETH, and you keep control everywhere control exists
+(`rewardRecipient` gets the creator slice; vault/airdrop admin is you). Available on
+Base + Robinhood Chain for ERC-20s and on Base for B20s; no dev buy; per-wallet daily
+cap. Registration on cc0.company happens server-side.
+
+```typescript
+// ERC-20 (Base or Robinhood Chain) — no signer needed at all
+const launchpad = new Cc0Launchpad({ chain: 'base' });
+const { active } = await launchpad.sponsorshipStatus();
+const res = active
+  ? await launchpad.launchTokenSponsored({ name, symbol, image, rewardRecipient, lpPreset: 'degen' })
+  : await launchpad.launchToken({ name, symbol, image, feeTier: 1 }); // self-paid fallback
+
+// B20 (Base) — custom supply + paired pools work here too
+const b20 = new Cc0B20Launchpad({});
+await b20.launchB20Sponsored({ name, symbol, image, supply: '420', rewardRecipient, lpPreset: 'degen' });
+```
+
+## What's new in 1.11.0
+
+- **Gas-sponsored launches** — `sponsorshipStatus()` + `launchTokenSponsored()` on
+  `Cc0Launchpad`; `sponsorshipStatus()` + `launchB20Sponsored()` on `Cc0B20Launchpad`.
+- **Staking fix** — `Cc0Staking.getPosition()` now reads the pool's `rewards(address)`
+  view; the previously-declared `earned(address)` does not exist on the deployed pool
+  and made every position read revert.
+- Paired launch books (ERC-20 + B20) live on Base mainnet.
 
 ## Paired launches — pair with any ERC-20 (80/20)
 

@@ -32,6 +32,8 @@ export type {
   ExternalSender,
   LaunchTokenParams,
   LaunchTokenResult,
+  SponsoredLaunchParams,
+  SponsoredLaunchResult,
   LaunchImage,
   PairedTokenOption,
   PairedTokenParam,
@@ -65,6 +67,8 @@ export type {
   Cc0B20Config,
   LaunchB20Params,
   LaunchB20Result,
+  SponsoredB20LaunchParams,
+  SponsoredB20LaunchResult,
 } from './b20';
 
 // Creator fees

@@ -37,7 +37,10 @@ const STAKING_ABI = [
   { type: 'function', name: 'exit', stateMutability: 'nonpayable', inputs: [], outputs: [] },
   { type: 'function', name: 'sync', stateMutability: 'nonpayable', inputs: [], outputs: [] },
   { type: 'function', name: 'stakedBalance', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
-  { type: 'function', name: 'earned', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
+  // NB: the deployed pool exposes `rewards(address)` (checkpointed WETH, realized by
+  // getReward()) — there is NO `earned(address)` on this deployment. Verified against
+  // the live bytecode; reading `earned` reverts.
+  { type: 'function', name: 'rewards', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'totalStaked', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'cooldownPeriod', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
   { type: 'function', name: 'unbondingAmount', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
@@ -54,7 +57,11 @@ const ERC20_ABI = [
 export interface StakingPosition {
   /** Currently staked and earning (wei). */
   staked: bigint;
-  /** Accrued WETH rewards claimable via claimRewards() (wei). */
+  /**
+   * Checkpointed WETH rewards claimable via claimRewards() (wei). Read from the
+   * pool's `rewards(address)` view — a lower bound: getReward() settles the exact
+   * amount (anything accrued since the last checkpoint is added at claim time).
+   */
   earned: bigint;
   /** Tokens in the unbonding cooldown (wei). */
   unbonding: bigint;
@@ -104,7 +111,7 @@ export class Cc0Staking {
     const c = this.contracts.STAKING;
     const [staked, earned, unbonding, unlockAt, totalStaked, cooldown] = await Promise.all([
       this.publicClient.readContract({ address: c, abi: STAKING_ABI, functionName: 'stakedBalance', args: [account] }),
-      this.publicClient.readContract({ address: c, abi: STAKING_ABI, functionName: 'earned', args: [account] }),
+      this.publicClient.readContract({ address: c, abi: STAKING_ABI, functionName: 'rewards', args: [account] }),
       this.publicClient.readContract({ address: c, abi: STAKING_ABI, functionName: 'unbondingAmount', args: [account] }),
       this.publicClient.readContract({ address: c, abi: STAKING_ABI, functionName: 'unbondingUnlockAt', args: [account] }),
       this.publicClient.readContract({ address: c, abi: STAKING_ABI, functionName: 'totalStaked', args: [] }),
