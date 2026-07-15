@@ -57,6 +57,9 @@ export {
   getB20PairedLaunchpad,
   isB20LaunchpadAvailable,
   isB20PairedLaunchpadAvailable,
+  mineB20VanitySalt,
+  predictB20AssetAddress,
+  CC0_VANITY_SUFFIX,
 } from './b20';
 export type {
   B20ComplianceMode,

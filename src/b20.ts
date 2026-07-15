@@ -508,6 +508,49 @@ function randomSalt(): Hex {
   return ('0x' + Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')) as Hex;
 }
 
+// ── Vanity address mining ──────────────────────────────────────────────────────────────
+// A B20 ASSET address is deterministic (base-std, verified on-chain):
+//   addr = 0xb2 ++ 00×10 ++ first 9 bytes of keccak256(abi.encode(deployer, salt))
+// The launchpad derives `salt` = keccak256(abi.encode(tokenAdmin, userSalt)); `deployer` is the
+// factory that calls createB20. Mining `userSalt` OFF-CHAIN steers the address SUFFIX — pure keccak,
+// no RPC, no contract change (the address is read from the TokenCreated event either way).
+
+const B20_ASSET_ADDR_PREFIX = 'b2' + '00'.repeat(10); // 22 hex
+
+/** Suffix every cc0.company B20 ends with. Lowercase hex, ≤ 9 bytes. */
+export const CC0_VANITY_SUFFIX = 'cc0';
+
+/** Predict a B20 ASSET token address for (factory deployer, tokenAdmin, userSalt). Exact, off-chain. */
+export function predictB20AssetAddress(factory: Address, tokenAdmin: Address, userSalt: Hex): Address {
+  const inner = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes32' }], [tokenAdmin, userSalt]));
+  const hash = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes32' }], [factory, inner]));
+  return `0x${B20_ASSET_ADDR_PREFIX}${hash.slice(2, 20)}` as Address;
+}
+
+/** Mine a userSalt whose predicted B20 ASSET address ends with `suffix`. Pure keccak (~4096 tries
+ *  for a 3-hex suffix). Returns null on an invalid suffix / exhausted budget → caller uses a random
+ *  salt (never blocks a launch). `factory` MUST be the actual deploy suite; `tokenAdmin` the resolved
+ *  admin (creator for managed, address(0) for trustless). */
+export function mineB20VanitySalt(
+  factory: Address,
+  tokenAdmin: Address,
+  suffix: string = CC0_VANITY_SUFFIX,
+  maxTries = 5_000_000,
+): { salt: Hex; address: Address } | null {
+  const want = suffix.toLowerCase().replace(/^0x/, '');
+  if (!/^[0-9a-f]{1,18}$/.test(want)) return null;
+  const seed = new Uint8Array(28);
+  if (typeof globalThis.crypto?.getRandomValues === 'function') globalThis.crypto.getRandomValues(seed);
+  else for (let i = 0; i < 28; i++) seed[i] = Math.floor(Math.random() * 256);
+  const base = Array.from(seed, (b) => b.toString(16).padStart(2, '0')).join('');
+  for (let i = 0; i < maxTries; i++) {
+    const salt = `0x${base}${i.toString(16).padStart(8, '0')}` as Hex;
+    const address = predictB20AssetAddress(factory, tokenAdmin, salt);
+    if (address.toLowerCase().endsWith(want)) return { salt, address };
+  }
+  return null;
+}
+
 function dedupeAddrs(a: Address[]): Address[] {
   const seen = new Set<string>();
   const out: Address[] = [];
@@ -1011,12 +1054,18 @@ export class Cc0B20Launchpad {
 
     // tokenAdmin selects the minted B20's admin model: trustless → address(0) (admin-less,
     // immutable supply), managed → the creator (DEFAULT_ADMIN). Fee split enforced either way.
+    const tokenAdmin = ((p.adminMode ?? 'trustless') === 'managed' ? creator : ZERO) as Address;
+    // Vanity: steer the token address to end in "cc0" (off-chain keccak mining against the ACTUAL
+    // deploy factory + resolved admin — same deploy, only the resulting address). Falls back to a
+    // random salt if mining fails, so a launch is never blocked.
+    const vanitySalt =
+      mineB20VanitySalt(suite.factory as Address, tokenAdmin, CC0_VANITY_SUFFIX)?.salt ?? randomSalt();
     const config = {
       tokenConfig: {
-        tokenAdmin: (p.adminMode ?? 'trustless') === 'managed' ? creator : ZERO,
+        tokenAdmin,
         name: p.name,
         symbol: p.symbol,
-        salt: randomSalt(),
+        salt: vanitySalt,
         image: imageUri,
         metadata: JSON.stringify({ description: p.description ?? '', socials: p.socials ?? [] }),
         context: 'cc0company-sdk',
