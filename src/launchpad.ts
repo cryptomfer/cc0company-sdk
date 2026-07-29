@@ -61,6 +61,7 @@ const TICK_SPACING = 200;
  * virtual WETH depth ≈ FDV at the current price):
  *   • classic — ~9.9 WETH starting FDV (~$36k): deep, steady price. The historical default.
  *   • degen   — ~1.3 WETH starting FDV (~$5k): thin, price ~7× more reactive at launch.
+ *              The CURRENT default (aligned with production, cc0strategy-v2-launch.ts:130-135).
  * Ticks must be multiples of TICK_SPACING and feed BOTH tickIfToken0IsClanker and
  * tickLower[0] — if they diverge the LP mint stops being one-sided and the launch reverts.
  */
@@ -69,7 +70,7 @@ export const LP_PRESETS = {
   degen: { startingTick: -250400 },
 } as const;
 
-/** Liquidity profile name ('classic' default | 'degen'). */
+/** Liquidity profile name ('classic' | 'degen' — 'degen' is the default since 1.12.0). */
 export type Cc0LpPreset = keyof typeof LP_PRESETS;
 
 /** Supply the preset ticks are calibrated for (the historical + B20 default), in WHOLE tokens. */
@@ -214,6 +215,13 @@ export interface PairedTokenOption {
   priceWeth: number;
 }
 
+/**
+ * One share of the creator's 75% fee split — FEES ONLY. Since 1.12.0 the vault admin,
+ * airdrop admin and dev-buy proceeds derive from the launching account (or the explicit
+ * `proceedsRecipient` param), NEVER from a slice — so slice ORDER no longer matters for
+ * anything except fee routing itself. (Reference: cc0strategy-v2-launch.ts:145 — only
+ * the fee slice is routable; vault/dev-buy proceeds always go to the creator.)
+ */
 export interface CreatorRewardSlice {
   /** Wallet receiving this share of the creator fees. */
   recipient: Address;
@@ -254,8 +262,29 @@ export interface LaunchTokenParams {
   /**
    * How to split the creator's 75%. Defaults to a single slice to the deployer.
    * Up to 5 slices; bps must sum to exactly 7500. Overridden by `nftCollection` (Option B).
+   * FEES ONLY — vault/airdrop admin and dev-buy proceeds are governed by
+   * `proceedsRecipient` (default: the launching account), never by these slices.
    */
   creatorRewards?: CreatorRewardSlice[];
+  /**
+   * Wallet receiving the NON-FEE proceeds: the vault admin, the airdrop admin, and the
+   * dev-buy tokens. Defaults to the launching account (walletClient/account/sender
+   * address — or `opts.creator` on the manual prepareLaunchTransaction path), matching
+   * the production launchpad (cc0strategy-v2-launch.ts:516, :546, :596). These are
+   * NEVER derived from `creatorRewards`: a fee slice may point at a contract (Option B
+   * wires slice[0] to the deployed Cc0NftFeeDistributor) and any vault/airdrop/dev-buy
+   * tokens sent to it would be permanently locked.
+   */
+  proceedsRecipient?: Address;
+  /**
+   * On-chain token admin (a metadata-only role). DEFAULT address(0) — BORN-RENOUNCED,
+   * matching every production launch (cc0strategy-v2-launch.ts:609-611): token scanners
+   * (GoPlus, DexScreener) read admin()=0 as "ownership renounced", so SDK launches scan
+   * identically to platform launches. Set an address ONLY if you genuinely want a
+   * metadata admin — scanners will then flag the token as NOT renounced. Fee control is
+   * unaffected either way: it lives in the locker's rewardAdmins, not here.
+   */
+  tokenAdmin?: Address;
   /**
    * Option B — route the FULL 75% creator slice to the holders of this NFT collection. The SDK
    * deploys a per-token Cc0NftFeeDistributor (an extra tx via your signer) and wires it as the sole
@@ -280,12 +309,20 @@ export interface LaunchTokenParams {
     percentage: number;
     lockupSeconds?: number;
     vestingSeconds?: number;
+    /** IPFS (Pinata) CID of the leaves JSON — recorded on cc0.company so the platform
+     *  claim flow can serve merkle proofs. Preferred over `entriesJson` for large sets
+     *  (an inline body would blow the request limit). */
+    entriesCid?: string;
+    /** Inline leaves JSON string (small sets / legacy) — recorded as airdrop_entries_json. */
+    entriesJson?: string;
   };
   /** Optional dev buy: ETH spent buying the token at launch (e.g. "0.05"). */
   devBuyEth?: string;
   /**
-   * Liquidity profile — 'classic' (default, ~$36k starting FDV, deep) or 'degen'
-   * (~$5k starting FDV, thin: the price needs ~7× less volume to move). See LP_PRESETS.
+   * Liquidity profile — 'degen' (DEFAULT, ~$5k starting FDV, thin: the price needs ~7×
+   * less volume to move) or 'classic' (~$36k starting FDV, deep). The default matches
+   * production (cc0strategy-v2-launch.ts:130-135 — 'degen' is the platform default;
+   * 'classic' remains fully supported). See LP_PRESETS.
    */
   lpPreset?: Cc0LpPreset;
   /**
@@ -318,6 +355,12 @@ export interface LaunchTokenResult {
    *  claim button). Launches are registered automatically; `false` means the
    *  registry was unreachable — the token is still fully live on-chain. */
   registered: boolean;
+  /** Airdrop launches only: the airdrop extension this launch registered its merkle
+   *  root on. NOTE it DIFFERS by launch mode — the PAIRED suite's AIRDROP_V2 for
+   *  paired launches, the standard suite's otherwise (cc0strategy-v2-launch.ts:160-164):
+   *  claims must target the EXACT extension this token used, so it is recorded
+   *  per-launch instead of hardcoded. */
+  airdropExtension?: Address;
 }
 
 /**
@@ -400,6 +443,10 @@ export interface PreparedLaunchTransaction extends PreparedTransaction {
   /** Paired launches only: the fully-resolved paired token (symbol/decimals/price) —
    *  pass it to registerLaunch so the token page records the pairing. */
   pairedToken?: PairedTokenOption;
+  /** Airdrop launches only: the airdrop extension wired into this config (paired suite's
+   *  vs standard suite's — they differ). Pass it to registerLaunch / finishLaunch so the
+   *  platform claim flow targets the exact contract. */
+  airdropExtension?: Address;
 }
 
 /**
@@ -757,7 +804,7 @@ export class Cc0Launchpad {
       if (!account) throw new Error('walletClient has no account attached.');
       const creator = account.address as Address;
 
-      const { config, totalMsgValue, imageUri, paired, factory } =
+      const { config, totalMsgValue, imageUri, paired, factory, airdropExtension } =
         await this.buildDeploymentConfig(effective, creator);
 
       const txHash = await this.walletClient.writeContract({
@@ -779,6 +826,7 @@ export class Cc0Launchpad {
         paired,
         nftDistributor,
         nftCollection: nftCollectionAddr,
+        airdropExtension,
       });
     }
 
@@ -798,6 +846,7 @@ export class Cc0Launchpad {
         paired: prepared.pairedToken,
         nftDistributor,
         nftCollection: nftCollectionAddr,
+        airdropExtension: prepared.airdropExtension,
       });
     }
 
@@ -894,6 +943,10 @@ export class Cc0Launchpad {
      *  the token page / NFT-detail / /rewards surfaces can find it. */
     nftDistributor?: Address;
     nftCollection?: Address;
+    /** Airdrop launches: the extension the config registered the merkle root on (from
+     *  PreparedLaunchTransaction.airdropExtension) — paired vs standard suites use
+     *  DIFFERENT extensions, so it is recorded per-launch for the claim flow. */
+    airdropExtension?: Address;
   }): Promise<LaunchTokenResult> {
     assertTxHash(args.txHash, 'finishLaunch');
     // Bounded wait — surface a clear error instead of hanging forever on a
@@ -918,14 +971,26 @@ export class Cc0Launchpad {
         image: args.imageUri,
         creator: args.creator,
         hasAirdrop: !!args.params.airdrop,
-        lpPreset: args.params.lpPreset,
+        // ALWAYS recorded — the effective preset, not only when caller-passed.
+        lpPreset: args.params.lpPreset ?? 'degen',
         paired: args.paired,
         nftFeeDistributor: args.nftDistributor,
         nftFeeCollection: args.nftCollection,
+        // Airdrop plumbing the platform claim flow needs (proof serving + the
+        // per-launch extension address — see record-token-launch.ts:98-103).
+        airdropMerkleRoot: args.params.airdrop?.merkleRoot,
+        airdropEntriesCid: args.params.airdrop?.entriesCid,
+        airdropEntriesJson: args.params.airdrop?.entriesJson,
+        airdropExtension: args.airdropExtension,
       });
     }
 
-    return { tokenAddress, txHash: args.txHash, registered };
+    return {
+      tokenAddress,
+      txHash: args.txHash,
+      registered,
+      ...(args.airdropExtension ? { airdropExtension: args.airdropExtension } : {}),
+    };
   }
 
   /**
@@ -942,7 +1007,7 @@ export class Cc0Launchpad {
     p: LaunchTokenParams,
     opts: { creator: Address },
   ): Promise<PreparedLaunchTransaction> {
-    const { config, totalMsgValue, imageUri, paired, factory } =
+    const { config, totalMsgValue, imageUri, paired, factory, airdropExtension } =
       await this.buildDeploymentConfig(p, opts.creator);
     // The PAIRED suite's factory for paired launches; the standard one otherwise.
     const to = factory;
@@ -977,6 +1042,7 @@ export class Cc0Launchpad {
       ...toPreparedTx(to, data, totalMsgValue, gas, fees, this.chainId),
       imageUri,
       pairedToken: paired,
+      airdropExtension,
     };
   }
 
@@ -994,8 +1060,19 @@ export class Cc0Launchpad {
     image?: string;
     creator: Address;
     hasAirdrop?: boolean;
-    /** Liquidity profile the launch used — recorded for the token page badge. */
+    /** Liquidity profile the launch used — recorded for the token page badge.
+     *  ALWAYS sent (defaults to 'degen', the launch default). */
     lpPreset?: Cc0LpPreset;
+    /** Airdrop plumbing for the platform claim flow (proof serving). The merkle root +
+     *  the leaves (IPFS CID preferred, inline JSON legacy). */
+    airdropMerkleRoot?: Hex;
+    airdropEntriesCid?: string;
+    airdropEntriesJson?: string;
+    /** The airdrop extension THIS launch registered on. NOTE: paired launches use the
+     *  PAIRED suite's AIRDROP_V2, standard launches the standard suite's — record the
+     *  exact one so claims never target a drifted/wrong contract
+     *  (cc0strategy-v2-launch.ts:160-164). */
+    airdropExtension?: Address;
     /** Paired launch: the resolved paired token — recorded so the token page shows the
      *  "Paired with $SYM" badge, the 80/20 split, and the paired claim assets. */
     paired?: { address: Address; symbol: string; decimals: number };
@@ -1018,7 +1095,14 @@ export class Cc0Launchpad {
           image_url: params.image || undefined,
           creator_wallet: params.creator,
           has_airdrop: !!params.hasAirdrop,
-          ...(params.lpPreset ? { lp_preset: params.lpPreset } : {}),
+          // ALWAYS recorded (aligned with the 'degen' launch default).
+          lp_preset: params.lpPreset ?? 'degen',
+          ...(params.airdropMerkleRoot ? { airdrop_merkle_root: params.airdropMerkleRoot } : {}),
+          ...(params.airdropEntriesCid ? { airdrop_entries_cid: params.airdropEntriesCid } : {}),
+          ...(params.airdropEntriesJson ? { airdrop_entries_json: params.airdropEntriesJson } : {}),
+          ...(params.airdropExtension
+            ? { airdrop_extension_address: params.airdropExtension }
+            : {}),
           ...(params.paired
             ? {
                 paired_token: params.paired.address.toLowerCase(),
@@ -1050,6 +1134,12 @@ export class Cc0Launchpad {
    * `reason` is 'disabled' (switch off / not deployed) or 'unfunded' (sponsor
    * wallet below its ETH floor). Probe this first, then call
    * `launchTokenSponsored()` — and fall back to `launchToken()` when inactive.
+   *
+   * NOTE — same-origin/server-side only today: the sponsored endpoints send no
+   * CORS headers, so this probe FAILS (reads as inactive) when called from a
+   * browser on a third-party origin. Browser integrators on other domains must
+   * use the self-signed `launchToken()` path; call the sponsored API from your
+   * server (or the cc0.company origin) instead.
    */
   async sponsorshipStatus(): Promise<{ active: boolean; reason?: 'disabled' | 'unfunded' }> {
     try {
@@ -1077,6 +1167,11 @@ export class Cc0Launchpad {
    *   • Base (8453) + Robinhood Chain (4663); Ethereum launches are self-paid.
    *   • No dev buy (it would spend the sponsor's ETH) — use launchToken() for that.
    *   • Per-wallet daily cap → HTTP 429 (the thrown Error carries the message).
+   *   • SAME-ORIGIN/SERVER-SIDE ONLY today: the sponsored endpoints send no CORS
+   *     headers, so calls from a browser on a third-party origin are blocked by
+   *     the browser. Third-party BROWSER integrators must use the self-signed
+   *     `launchToken()` path; sponsored launches work from servers, scripts, and
+   *     agents (no CORS there) or from the cc0.company origin itself.
    *
    * The image is pinned to IPFS first when raw bytes/Blob are passed (public
    * endpoint — still no signer needed).
@@ -1144,12 +1239,23 @@ export class Cc0Launchpad {
     paired?: PairedTokenOption;
     /** The factory deployToken targets — the PAIRED suite's for paired launches. */
     factory: Address;
+    /** Airdrop launches: the suite's airdrop extension wired into this config. */
+    airdropExtension?: Address;
   }> {
     const c = this.contracts;
 
+    // Vault admin + airdrop admin + dev-buy recipient ALWAYS derive from the creator
+    // (or the explicit proceedsRecipient override) — NEVER from a creatorRewards slice.
+    // Aligned with cc0strategy-v2-launch.ts:342 (rewardRecipient ?? creator): under
+    // Option B slice[0] is the Cc0NftFeeDistributor CONTRACT, and vault/airdrop/dev-buy
+    // tokens sent there would be permanently locked (the factory accepts the config —
+    // nothing on-chain saves the caller).
+    const proceedsRecipient = p.proceedsRecipient ?? creator;
+
     // Liquidity profile → starting tick (⇒ starting FDV ⇒ depth). Fail on unknown
-    // names instead of silently launching a 'classic' the caller didn't ask for.
-    const lpPreset = p.lpPreset ?? 'classic';
+    // names instead of silently launching a preset the caller didn't ask for.
+    // Default 'degen' — aligned with production (cc0strategy-v2-launch.ts:130-135).
+    const lpPreset = p.lpPreset ?? 'degen';
     if (!LP_PRESETS[lpPreset]) {
       throw new Error(
         `Unknown lpPreset "${lpPreset}" — use one of: ${Object.keys(LP_PRESETS).join(', ')}.`,
@@ -1180,6 +1286,7 @@ export class Cc0Launchpad {
         publicClient: this.publicClient,
         registryUrl: this.registryUrl,
         weth: c.WETH,
+        chainSlug: this.chainSlug,
       });
     }
 
@@ -1222,9 +1329,10 @@ export class Cc0Launchpad {
     const imageUri = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
 
     // ── Creator slices (their 75%, splittable) ────────────────────────────────
-    // Paired launches skip the 7500-sum validation: the split is the pinned
-    // two-slice 80/20 and creatorSlices collapses to the single default slice
-    // (still referenced below as the vault/airdrop/dev-buy admin).
+    // FEES ONLY — vault/airdrop admin + dev-buy proceeds are `proceedsRecipient`
+    // above, never a slice. Paired launches skip the 7500-sum validation: the
+    // split is the pinned two-slice 80/20 and creatorSlices collapses to the
+    // single default slice.
     const creatorSlices: CreatorRewardSlice[] =
       p.creatorRewards && p.creatorRewards.length > 0
         ? p.creatorRewards
@@ -1376,7 +1484,8 @@ export class Cc0Launchpad {
           ],
           [
             {
-              admin: creatorSlices[0].recipient,
+              // Creator-derived, never slice[0] (cc0strategy-v2-launch.ts:516).
+              admin: proceedsRecipient,
               lockupDuration: BigInt(
                 Math.max(p.vault.lockupSeconds, VAULT_MIN_LOCKUP_SECONDS),
               ),
@@ -1406,7 +1515,8 @@ export class Cc0Launchpad {
           ],
           [
             {
-              admin: creatorSlices[0].recipient,
+              // Creator-derived, never slice[0] (cc0strategy-v2-launch.ts:546).
+              admin: proceedsRecipient,
               merkleRoot: p.airdrop.merkleRoot,
               lockupDuration: BigInt(
                 Math.max(p.airdrop.lockupSeconds ?? 0, AIRDROP_MIN_LOCKUP_SECONDS),
@@ -1456,7 +1566,8 @@ export class Cc0Launchpad {
                 hooks: '0x0000000000000000000000000000000000000000',
               },
               pairedTokenAmountOutMinimum: BigInt(0),
-              recipient: creatorSlices[0].recipient,
+              // Creator-derived, never slice[0] (cc0strategy-v2-launch.ts:596).
+              recipient: proceedsRecipient,
             },
           ],
         ),
@@ -1464,9 +1575,13 @@ export class Cc0Launchpad {
     }
 
     // ── Assemble + send ───────────────────────────────────────────────────────
+    // BORN-RENOUNCED by default: tokenAdmin = address(0) in the SAME deployToken tx,
+    // matching production launches (cc0strategy-v2-launch.ts:609-611) — scanners
+    // (GoPlus / DexScreener) read admin()=0 → "ownership renounced". Metadata-only
+    // role; fee control lives in the locker rewardAdmins and is untouched.
     const config = {
       tokenConfig: {
-        tokenAdmin: creator,
+        tokenAdmin: p.tokenAdmin ?? ('0x0000000000000000000000000000000000000000' as Address),
         name: p.name,
         symbol: p.symbol,
         salt: p.salt ?? randomSalt(),
@@ -1496,7 +1611,18 @@ export class Cc0Launchpad {
       extensionConfigs: extensions,
     };
 
-    return { config, totalMsgValue, imageUri, paired, factory: suite.FACTORY };
+    return {
+      config,
+      totalMsgValue,
+      imageUri,
+      paired,
+      factory: suite.FACTORY,
+      // Recorded per-launch: the PAIRED suite's AIRDROP_V2 differs from the standard
+      // suite's, and claims must target the exact extension this token registered on
+      // (cc0strategy-v2-launch.ts:160-164, :683-684).
+      airdropExtension:
+        p.airdrop && p.airdrop.percentage > 0 ? suite.AIRDROP_V2 : undefined,
+    };
   }
 }
 
@@ -1574,6 +1700,10 @@ export async function resolvePairedToken(
     registryUrl: string;
     /** The chain's canonical WETH — pairing with it is just the standard launch. */
     weth: Address;
+    /** Chain the paired token + WETH live on — drives the price-API lookup. Defaults
+     *  to 'base' for back-compat; chain-aware callers (the Cc0Launchpad instance)
+     *  MUST pass their own slug or Robinhood/Ethereum lookups resolve nothing. */
+    chainSlug?: Cc0ChainSlug;
   },
 ): Promise<PairedTokenOption> {
   const address = input.address;
@@ -1620,9 +1750,13 @@ export async function resolvePairedToken(
   // with GeckoTerminal as its fallback; WETH resolves via the standard path.
   let priceWeth = 0;
   try {
+    // Both lookups on the INSTANCE's chain — a hardcoded 'base,base' made auto price
+    // resolution impossible on Robinhood (the paired token + RH WETH are not Base
+    // addresses there).
+    const slug = opts.chainSlug ?? 'base';
     const url =
       `${opts.registryUrl}/api/store/token-prices` +
-      `?addresses=${address},${opts.weth}&types=cc0strategy,external&chains=base,base&holders=0`;
+      `?addresses=${address},${opts.weth}&types=cc0strategy,external&chains=${slug},${slug}&holders=0`;
     const res = await fetch(url, {
       headers: { Accept: 'application/json' },
       signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,

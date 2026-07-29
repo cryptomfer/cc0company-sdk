@@ -192,9 +192,9 @@ export interface Cc0PairedContracts {
 }
 
 /**
- * Per-chain PAIRED ERC-20 launchpad deployments. Base is PRE-STAGED (empty factory) until the
- * dual-mode suite's mainnet broadcast — `isCc0PairedAvailable('base')` stays false and every
- * paired ERC-20 launch fails closed, so nothing can silently target a non-existent factory.
+ * Per-chain PAIRED ERC-20 launchpad deployments. LIVE on Base (8453) and Robinhood Chain (4663);
+ * a chain with no entry (or an empty factory) makes `isCc0PairedAvailable()` false and every
+ * paired ERC-20 launch there fail closed, so nothing can silently target a non-existent factory.
  * Reused live infra (feeLocker/staking) is pre-filled — same shared fee locker as every launch.
  */
 export const CC0_PAIRED_CONTRACTS: Partial<Record<Cc0ChainSlug, Cc0PairedContracts>> = {
@@ -216,7 +216,44 @@ export const CC0_PAIRED_CONTRACTS: Partial<Record<Cc0ChainSlug, Cc0PairedContrac
     WETH: '0x4200000000000000000000000000000000000006',
     CC0COMPANY: '0x67c5F00491c09cbCF6359f95690574E6106bb3CF',
   },
+  robinhood: {
+    chainId: 4663,
+    // LIVE — deployed + Blockscout-verified 9/9 (robinhoodchain.blockscout.com).
+    // The standard RH factory (0x79F331d3…) was NOT touched: existing Robinhood tokens keep
+    // their pages, swaps and fee claims on it. This suite is used ONLY when `pairedToken` is
+    // set — which on RH means pairing against one of the 100+ official tokenized stocks.
+    FACTORY: '0x65D667870E7B5b4b7113e5BaB255efE052cf3B36',
+    HOOK_STATIC_FEE: '0x3f27fB70d91ad868FD6b94dB67CB919b38B7E8cC',
+    HOOK_DYNAMIC_FEE: '0xE461d34701abCD106663fb54d8E49ad253a6a8cC',
+    LOCKER: '0x4FbAccF2CC6aA1F93a99eA087003Ad61af6608CA',
+    MEV_BLOCK_DELAY: '0x0De94068195C5d85e31406804357F44E0D20E255',
+    MEV_SNIPER_TAX: '0x70baFfe8783396142385Ece53f2cDF8D1cf9872C',
+    VAULT: '0xE3D6539B9Bc2E1b7e0Be45a7A97cc28714FF411B',
+    AIRDROP_V2: '0xa8F76d9e1722548aE7981dFD0C039abd72705999',
+    DEV_BUY_V4: '0x788350DF3F53202dBA9bED1Ce05488C6c2C75737',
+    FEE_LOCKER: '0x343d77D94A119D5cEA495aeE8336A3a7Aa5CD385',
+    /** Cc0StakingEscrow — unused by paired launches (80/20 has no staking slice); kept for
+     *  shape parity with the standard book. */
+    STAKING: '0xE4542b52Ed212bDcFb10f3C9F8A12f2cEeeF35b2',
+    WETH: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+    /** $cc0company lives on Base only — kept for shape parity. */
+    CC0COMPANY: '0x67c5F00491c09cbCF6359f95690574E6106bb3CF',
+  },
 };
+
+/**
+ * The official Robinhood tokenized-stock issuer on Robinhood Chain (4663). Every one of the
+ * 100+ tokenized stocks (AAPL, TSLA, NVDA, MSFT, SPY, QQQ, COIN, MSTR, GME, …) is a contract
+ * this proxy created — all 18-decimals, named "<Company> • Robinhood Token". Any of them can
+ * be the `pairedToken` of a paired launch on RH.
+ *
+ * Enumerate them from the explorer's internal-transactions feed:
+ *   GET https://robinhoodchain.blockscout.com/api/v2/addresses/{issuer}/internal-transactions
+ *   → paginate via `next_page_params`, keep items where /create/i.test(item.type),
+ *     take `item.created_contract.hash`, then resolve symbol()/name()/decimals() on-chain.
+ */
+export const ROBINHOOD_TOKENIZED_STOCK_ISSUER =
+  '0x4783C67b63dE2B358Ac5951a7D41F47A38F3C046' as Address;
 
 /** PAIRED-suite address book for a chain, or null when not deployed/filled there (fail-closed). */
 export function getCc0PairedContracts(chain?: Cc0Chain): Cc0PairedContracts | null {
