@@ -404,9 +404,13 @@ export interface LaunchB20Params {
   /** Optional dev buy: ETH spent buying the token at launch (e.g. "0.05"). */
   devBuyEth?: string;
   /**
-   * Liquidity profile — 'classic' (default, ~$36k starting FDV at the 100B default supply)
-   * or 'degen' (~$5k: the price needs ~7× less volume to move). A custom `supply` scales
-   * the dollar figures proportionally; degen stays ~7× thinner either way.
+   * Liquidity profile — 'classic' (default, ~$36k starting FDV) or 'degen' (~$5k: the price
+   * needs ~7× less volume to move). The preset's FDV holds CONSTANT at any launch `supply`:
+   * the starting tick is derived from the supply (startingTickForSupply shifts it by
+   * ln(DEFAULT/supply)/ln(1.0001)), so a custom supply only changes the price per token,
+   * never the pool's starting market cap. (The old "scales proportionally" behaviour was a
+   * fund-losing bug: a fixed tick with a tiny supply priced the pool at ~$0 and one small
+   * buy drained it.) Degen stays ~7× thinner than classic either way.
    */
   lpPreset?: Cc0LpPreset;
   /**
