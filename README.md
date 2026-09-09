@@ -115,7 +115,8 @@ const { tokenAddress, txHash } = await launchpad.launchToken({
   symbol: 'MTK',
   image: 'https://my.site/art.png', // ANY url or raw bytes — pinned to IPFS for you
   description: 'My awesome token',  // stored on-chain
-  feeTier: 1,                       // 1 | 2 | 3 % static LP fee, or feeMode: 'dynamic'
+  // Pool fee is a fixed 1% on cc0.company — nothing to pick (any other feeTier /
+  // feeMode throws, never substituted).
 });
 ```
 
@@ -146,9 +147,8 @@ await launchpad.launchToken({
   symbol: 'MTK',
   image: 'ipfs://QmYourImageHash',
 
-  // Fees: static tier or the dynamic 1%→3% volatility preset
-  feeMode: 'static',                 // 'static' (default) | 'dynamic'
-  feeTier: 1,                        // 1 | 2 | 3 (static only)
+  // Pool fee: fixed 1% static on every cc0.company launch. feeTier / feeMode are
+  // accepted only as 1 / 'static' (deprecated) — anything else throws.
 
   // Split YOUR 75% across up to 5 wallets (bps of total fees, must sum to 7500)
   creatorRewards: [

@@ -178,16 +178,22 @@ const FEE_IN = { both: 0, paired: 1, token: 2 } as const;
 /** How a creator slice takes its fees: WETH + token, WETH only, or token only. */
 export type CreatorFeePreference = keyof typeof FEE_IN;
 
-// Clanker "Dynamic 3%" preset (1% base → 3% max, volatility-driven), 1e6 fee units.
-const DYNAMIC_3_CONFIG = {
-  baseFee: 10_000,
-  maxLpFee: 30_000,
-  referenceTickFilterPeriod: BigInt(30),
-  resetPeriod: BigInt(120),
-  resetTickFilter: 200,
-  feeControlNumerator: BigInt(250_000_000),
-  decayFilterBps: 7500,
-} as const;
+// Pool fee: FIXED 1% static on every cc0.company launch (product decision 2026-09-09). The
+// deployed hooks accept more, and a dynamic hook exists per suite for pools launched before —
+// but no new launch may pick either: any other feeTier / feeMode THROWS (never substituted),
+// exactly like the production launch lib and the sponsored relays.
+const POOL_FEE_UNITS = 10_000; // 1% in the hook's 1e6 fee units
+
+/** Refuse — never coerce — any pool fee other than the fixed 1% static tier. */
+export function assertFixedPoolFee(feeMode: unknown, feeTier: unknown): void {
+  const modeOk = feeMode === undefined || feeMode === null || feeMode === 'static';
+  const tierOk = feeTier === undefined || feeTier === null || Number(feeTier) === 1;
+  if (!modeOk || !tierOk) {
+    throw new Error(
+      'cc0.company launches use a fixed 1% static pool fee — no other tier and no dynamic fee. Omit feeTier / feeMode.',
+    );
+  }
+}
 
 // ─── Params ──────────────────────────────────────────────────────────────────
 
@@ -255,10 +261,10 @@ export interface LaunchTokenParams {
   /** Description + socials are stored on-chain in the token metadata. */
   description?: string;
   socials?: string[];
-  /** 'static' (1/2/3% tier) or 'dynamic' (1%→3% volatility preset). Default 'static'. */
-  feeMode?: 'static' | 'dynamic';
-  /** Static LP fee tier in percent: 1, 2, 3, or 6.9. Default 1. Ignored when feeMode === 'dynamic'. */
-  feeTier?: 1 | 2 | 3 | 6.9;
+  /** @deprecated The pool fee is a fixed 1% static on cc0.company — only 'static' is accepted; omit it. */
+  feeMode?: 'static';
+  /** @deprecated The pool fee is a fixed 1% — only 1 is accepted; omit it. Anything else throws. */
+  feeTier?: 1;
   /**
    * How to split the creator's 75%. Defaults to a single slice to the deployer.
    * Up to 5 slices; bps must sum to exactly 7500. Overridden by `nftCollection` (Option B).
@@ -377,8 +383,10 @@ export interface SponsoredLaunchParams {
   /** 'pin' (default) guarantees IPFS permanence; 'as-is' trusts a URL string. */
   imagePolicy?: 'pin' | 'as-is';
   description?: string;
-  feeMode?: 'static' | 'dynamic';
-  feeTier?: 1 | 2 | 3 | 6.9;
+  /** @deprecated Fixed 1% static pool fee — only 'static' is accepted; omit it. */
+  feeMode?: 'static';
+  /** @deprecated Fixed 1% pool fee — only 1 is accepted; omit it. */
+  feeTier?: 1;
   sniperTax?: { startingBps: number; endingBps: number; secondsToDecay: number };
   vault?: { percentage: number; lockupSeconds: number; vestingSeconds: number };
   airdrop?: { merkleRoot: Hex; percentage: number; lockupSeconds?: number; vestingSeconds?: number };
@@ -1186,6 +1194,8 @@ export class Cc0Launchpad {
         'rewardRecipient is required for a sponsored launch (no signer configured to default from).',
       );
     }
+    // Fixed 1% pool fee — refused here before any network call; the relay refuses it too.
+    assertFixedPoolFee(p.feeMode, p.feeTier);
     const image = await this.resolveImage(p.image, p.imagePolicy ?? 'pin');
     const res = await fetch(`${this.registryUrl}/api/cc0strategy/sponsor-launch`, {
       method: 'POST',
@@ -1196,8 +1206,7 @@ export class Cc0Launchpad {
         symbol: p.symbol,
         image,
         description: p.description,
-        feeMode: p.feeMode,
-        feeTier: p.feeTier ?? 1,
+        feeTier: 1,
         sniperTax: p.sniperTax,
         vault: p.vault,
         airdrop: p.airdrop,
@@ -1376,41 +1385,13 @@ export class Cc0Launchpad {
           FEE_IN.paired, // treasury — WETH only, enforced
         ];
 
-    // ── Fee hook + feeData ────────────────────────────────────────────────────
-    const feeMode = p.feeMode ?? 'static';
-    let hook: Address;
-    let feeData: Hex;
-    if (feeMode === 'dynamic') {
-      hook = suite.HOOK_DYNAMIC_FEE;
-      feeData = encodeAbiParameters(
-        [
-          { name: 'baseFee', type: 'uint24' },
-          { name: 'maxLpFee', type: 'uint24' },
-          { name: 'referenceTickFilterPeriod', type: 'uint256' },
-          { name: 'resetPeriod', type: 'uint256' },
-          { name: 'resetTickFilter', type: 'int24' },
-          { name: 'feeControlNumerator', type: 'uint256' },
-          { name: 'decayFilterBps', type: 'uint24' },
-        ],
-        [
-          DYNAMIC_3_CONFIG.baseFee,
-          DYNAMIC_3_CONFIG.maxLpFee,
-          DYNAMIC_3_CONFIG.referenceTickFilterPeriod,
-          DYNAMIC_3_CONFIG.resetPeriod,
-          DYNAMIC_3_CONFIG.resetTickFilter,
-          DYNAMIC_3_CONFIG.feeControlNumerator,
-          DYNAMIC_3_CONFIG.decayFilterBps,
-        ],
-      );
-    } else {
-      hook = suite.HOOK_STATIC_FEE;
-      // 1e6 units: 1/2/3/6.9% -> 10000/20000/30000/69000. Round (6.9*10000 isn't exact in float).
-      const feeUnits = Math.round((p.feeTier ?? 1) * 10_000);
-      feeData = encodeAbiParameters(
-        [{ name: 'clankerFee', type: 'uint24' }, { name: 'pairedFee', type: 'uint24' }],
-        [feeUnits, feeUnits],
-      );
-    }
+    // ── Fee hook + feeData — fixed 1% static; anything else throws (never substituted) ──
+    assertFixedPoolFee(p.feeMode, p.feeTier);
+    const hook: Address = suite.HOOK_STATIC_FEE;
+    const feeData: Hex = encodeAbiParameters(
+      [{ name: 'clankerFee', type: 'uint24' }, { name: 'pairedFee', type: 'uint24' }],
+      [POOL_FEE_UNITS, POOL_FEE_UNITS],
+    );
 
     const poolData = encodeAbiParameters(
       [

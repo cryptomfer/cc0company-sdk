@@ -4,6 +4,19 @@ All notable changes to `@cc0company/sdk`. Behaviour is aligned with the producti
 launchpad reference implementation (`cc0strategy-v2-launch.ts` in the cc0.company
 frontend) unless explicitly noted.
 
+## 1.13.0
+
+### Changed
+
+- **Pool fee is a fixed 1% static on every cc0.company launch** (ERC-20 `launchToken` /
+  `prepareLaunchTransaction` / `launchTokenSponsored`, B20 `launchB20` / `launchB20Sponsored`).
+  The 2% / 3% / 6.9% static tiers and the dynamic (1%→3% volatility) hook can no longer be
+  requested: `feeTier` is narrowed to `1` and `feeMode` to `'static'` (both `@deprecated` —
+  omit them), and any other value **throws** before a signature is asked for, rather than
+  being silently replaced. The sponsored relays on cc0.company enforce the same rule (400).
+  Pools launched on the dynamic hook before this release are unaffected. Matches production
+  (`cc0strategy-v2-launch.ts` / `b20-launchpad-launch.ts`, `CC0_POOL_FEE_PERCENT`).
+
 ## 1.12.0
 
 ### Fixed
