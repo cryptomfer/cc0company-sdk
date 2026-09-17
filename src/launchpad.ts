@@ -1813,19 +1813,24 @@ export async function resolvePairedToken(
     return { address, symbol, decimals, priceWeth: input.priceWeth };
   }
 
-  // Live resolution: paired USD ÷ WETH USD from the cc0.company price API — the same
+  // Live resolution: paired USD ÷ ETH/USD from the cc0.company price API — the same
   // API family the SDK already uses to register launches. `types=cc0strategy` routes
   // the paired token through the on-chain V4 spot probe (instant for launchpad tokens)
-  // with GeckoTerminal as its fallback; WETH resolves via the standard path.
+  // with GeckoTerminal as its fallback. The ETH/USD reference is the chain's WETH row —
+  // except where the "weth" slot is a stable (Arc: USDC, $1), which would leave the price
+  // in dollars while the tick math expects WETH terms; there Base WETH's row is used.
   let priceWeth = 0;
   try {
     // Both lookups on the INSTANCE's chain — a hardcoded 'base,base' made auto price
     // resolution impossible on Robinhood (the paired token + RH WETH are not Base
     // addresses there).
     const slug = opts.chainSlug ?? 'base';
+    const stableQuoted = standardPairFor(slug).symbol !== 'WETH';
+    const ethRef = stableQuoted ? '0x4200000000000000000000000000000000000006' : opts.weth;
+    const ethRefSlug = stableQuoted ? 'base' : slug;
     const url =
       `${opts.registryUrl}/api/store/token-prices` +
-      `?addresses=${address},${opts.weth}&types=cc0strategy,external&chains=${slug},${slug}&holders=0`;
+      `?addresses=${address},${ethRef}&types=cc0strategy,external&chains=${slug},${ethRefSlug}&holders=0`;
     const res = await fetch(url, {
       headers: { Accept: 'application/json' },
       signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
@@ -1833,7 +1838,7 @@ export async function resolvePairedToken(
     const json = res.ok ? await res.json().catch(() => null) : null;
     const prices = (json?.prices ?? {}) as Record<string, { price_usd?: number }>;
     const pairedUsd = Number(prices[address.toLowerCase()]?.price_usd ?? 0);
-    const wethUsd = Number(prices[opts.weth.toLowerCase()]?.price_usd ?? 0);
+    const wethUsd = Number(prices[ethRef.toLowerCase()]?.price_usd ?? 0);
     if (Number.isFinite(pairedUsd) && pairedUsd > 0 && Number.isFinite(wethUsd) && wethUsd > 0) {
       priceWeth = pairedUsd / wethUsd;
     }

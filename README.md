@@ -8,7 +8,8 @@ claim creator fees, and stake $cc0company — from any website, app, or AI agent
   LP fee to you, 15% to $cc0company stakers, 10% to the platform. New in 1.14.0: **Arc**
   (Circle's L1, chain 5042) — USDC is the gas token and every pool is quoted in USDC; the
   SDK re-ticks the pool at the live ETH/USD so the preset's starting FDV holds in dollars
-  (fail-closed), and dev buys are refused there (no WETH on Arc). Or pair the pool with
+  (fail-closed), and dev buys are refused there (no WETH on Arc). 1.14.1: paired (80/20) launches
+  on Arc — the one Arc factory is dual-mode, so `pairedToken` works there too. Or pair the pool with
   **any ERC-20 instead of WETH** — an 80/20 paired launch (LIVE on Base mainnet for both ERC-20s and B20s). New in 1.11.0: gas-sponsored launches, the platform pays the deploy gas on Base + Robinhood Chain (launchTokenSponsored / launchB20Sponsored, zero ETH needed).
 - **`Cc0Fees`** — read and claim your accrued trading fees (WETH + your token), on the
   chain you launched on.

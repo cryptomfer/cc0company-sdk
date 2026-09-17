@@ -261,8 +261,9 @@ export interface Cc0PairedContracts {
 }
 
 /**
- * Per-chain PAIRED ERC-20 launchpad deployments. LIVE on Base (8453) and Robinhood Chain (4663);
- * a chain with no entry (or an empty factory — Ethereum, Arc today) makes `isCc0PairedAvailable()`
+ * Per-chain PAIRED ERC-20 launchpad deployments. LIVE on Base (8453), Robinhood Chain (4663) and
+ * Arc (5042 — the one factory there is dual-mode from day one, so the paired book is the standard
+ * book); a chain with no entry (or an empty factory — Ethereum today) makes `isCc0PairedAvailable()`
  * false and every paired ERC-20 launch there fail closed, so nothing can silently target a
  * non-existent factory.
  * Reused live infra (feeLocker/staking) is pre-filled — same shared fee locker as every launch.
@@ -307,6 +308,27 @@ export const CC0_PAIRED_CONTRACTS: Partial<Record<Cc0ChainSlug, Cc0PairedContrac
     STAKING: '0xE4542b52Ed212bDcFb10f3C9F8A12f2cEeeF35b2',
     WETH: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
     /** $cc0company lives on Base only — kept for shape parity. */
+    CC0COMPANY: '0x67c5F00491c09cbCF6359f95690574E6106bb3CF',
+  },
+  arc: {
+    chainId: 5042,
+    // LIVE — the SAME suite as CC0_CONTRACTS.arc: the Arc factory was deployed as the dual-mode
+    // Clanker (`weth()` = USDC; a pool paired with anything else takes the enforced 80/20
+    // split). No second suite exists or is needed there. No dev buy on Arc (no WETH9).
+    FACTORY: '0x79F331d3d7977062d5c78Ad122851fC57Ee3DC1a',
+    HOOK_STATIC_FEE: '0xaC20F9af70538700be01ad87538b117159B1E8Cc',
+    HOOK_DYNAMIC_FEE: '0x109010Fcd32c06e4c4EB9cc2d496970358bba8cc',
+    LOCKER: '0x99595FB33e2599688b78F93569875c010648A359',
+    MEV_BLOCK_DELAY: '0x0De94068195C5d85e31406804357F44E0D20E255',
+    MEV_SNIPER_TAX: '0x70baFfe8783396142385Ece53f2cDF8D1cf9872C',
+    VAULT: '0xB8bC0bb444a65B1896D0557A273C5Be269d701C9',
+    AIRDROP_V2: '0xD4B6AE01Ddcb336DCcACcca28f02cC70195c0b8f',
+    DEV_BUY_V4: '0x0000000000000000000000000000000000000000',
+    FEE_LOCKER: '0x343d77D94A119D5cEA495aeE8336A3a7Aa5CD385',
+    /** Cc0StakingEscrow — unused by paired launches (80/20 has no staking slice). */
+    STAKING: '0xE4542b52Ed212bDcFb10f3C9F8A12f2cEeeF35b2',
+    /** The standard pair on Arc: the USDC ERC-20 interface (6 decimals). */
+    WETH: '0x3600000000000000000000000000000000000000',
     CC0COMPANY: '0x67c5F00491c09cbCF6359f95690574E6106bb3CF',
   },
 };
