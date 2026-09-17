@@ -20,6 +20,8 @@ export {
   DEFAULT_SUPPLY_WHOLE,
   startingTickForSupply,
   startingTickForPairedLaunch,
+  startingTickForStablePair,
+  fetchEthUsd,
   guardedPairedStartingTick,
   impliedFdvWethAtTick,
   resolvePairedToken,
@@ -109,8 +111,9 @@ export type {
   PinResult,
 } from './drops';
 
-// Addresses + protocol constants + chains (Base 8453 · Ethereum 1 · Robinhood Chain 4663)
+// Addresses + protocol constants + chains (Base 8453 · Ethereum 1 · Robinhood Chain 4663 · Arc 5042)
 export {
+  arcChain,
   CC0_CONTRACTS,
   CC0_PAIRED_CONTRACTS,
   CHAIN_IDS,
@@ -120,6 +123,7 @@ export {
   PAIRED_SPLIT,
   PROTOCOL_SPLIT,
   robinhoodChain,
+  standardPairFor,
   toChainSlug,
   VAULT_MIN_LOCKUP_SECONDS,
   AIRDROP_MIN_LOCKUP_SECONDS,

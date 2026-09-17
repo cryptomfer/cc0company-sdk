@@ -5,16 +5,24 @@ import { defineChain } from 'viem';
 /**
  * cc0.company launchpad contracts — per chain.
  *
- * The launchpad is live on THREE networks (same Clanker-fork factory, same enforced 75/15/10
+ * The launchpad is live on FOUR networks (same Clanker-fork factory, same enforced 75/15/10
  * split, independently deployed + verified on each chain's explorer):
  *   • Base (8453)            — basescan.org
  *   • Ethereum mainnet (1)   — etherscan.io
  *   • Robinhood Chain (4663) — robinhoodchain.blockscout.com (Arbitrum-Orbit L2, ETH gas)
+ *   • Arc (5042)             — explorer.arc.io (Circle's L1: USDC is the gas token, pools are
+ *                              quoted in USDC — there is no WETH on Arc)
  *
  * `STAKING` is the enforced 15% recipient on each chain. On Base it's the actual Cc0Staking pool;
  * on Ethereum it's the bridge forwarder (WETH → OP bridge → Base pool); on Robinhood Chain it's
- * the escrow feeding the Relay bridge to the same Base pool. Either way: stake $cc0company on
- * BASE, earn from launches on all three chains.
+ * the escrow feeding the Relay bridge to the same Base pool; on Arc it's the escrow feeding the
+ * CCTP V2 forwarder (USDC burned on Arc → minted on Base → swapped to WETH → the pool). Either
+ * way: stake $cc0company on BASE, earn from launches on all four chains.
+ *
+ * `WETH` is the chain's STANDARD PAIR — the quote asset of every 75/15/10 pool. On Base, Ethereum
+ * and Robinhood Chain it is the canonical WETH (18 decimals); on Arc it is the USDC ERC-20
+ * interface (6 decimals). `PAIR_SYMBOL` / `PAIR_DECIMALS` say which, so integrators format the
+ * "weth" leg of fee claims correctly.
  */
 
 export const CC0_CONTRACTS = {
@@ -37,6 +45,8 @@ export const CC0_CONTRACTS = {
     AIRDROP_V2: '0x8f6f4612CDdcFE0454aA3c448cb05bFCA5479994' as Address,
     DEV_BUY_V4: '0xA9AF8A07FdeB2775646ad5071bAF14CA3749FfC5' as Address,
     WETH: '0x4200000000000000000000000000000000000006' as Address,
+    PAIR_SYMBOL: 'WETH',
+    PAIR_DECIMALS: 18,
     /** NFT-holder fee distribution (Option B): factory deploys a per-token distributor; */
     /** router claims a holder's rewards across many distributors in one tx. */
     NFT_FEE_FACTORY: '0x7867f16Cf2abF38C592b7b4f4807AC28B284a727' as Address,
@@ -58,6 +68,8 @@ export const CC0_CONTRACTS = {
     AIRDROP_V2: '0x8Fa248F99a98B8E2cCC8A0A3Bb620ACe65B92eF5' as Address,
     DEV_BUY_V4: '0xbFD1e50b1dDB2657D6F61930fECa44C591606834' as Address,
     WETH: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' as Address,
+    PAIR_SYMBOL: 'WETH',
+    PAIR_DECIMALS: 18,
     NFT_FEE_FACTORY: '0xF283576Ed3b2eE25BE27772Fc98f3c70d54aBc41' as Address,
     NFT_REWARDS_ROUTER: '0xEcc5b3318236Fa5c569F72609F22Ea453bC5DF7B' as Address,
   },
@@ -77,13 +89,42 @@ export const CC0_CONTRACTS = {
     AIRDROP_V2: '0xD4B6AE01Ddcb336DCcACcca28f02cC70195c0b8f' as Address,
     DEV_BUY_V4: '0x17566b5eB895f7550f820d28615e29B8F2a08212' as Address,
     WETH: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73' as Address,
+    PAIR_SYMBOL: 'WETH',
+    PAIR_DECIMALS: 18,
     NFT_FEE_FACTORY: '0xfd0327Adf529fA856Eb1225b9761E332A7646c3F' as Address,
     NFT_REWARDS_ROUTER: '0x140b6EE50e1a218c3df9984dec42eA3eDaB1d06c' as Address,
+  },
+  arc: {
+    // LIVE — deployed 2026-09-17 (DeployArc.s.sol through the official RPC), explorer.arc.io.
+    FACTORY: '0x79F331d3d7977062d5c78Ad122851fC57Ee3DC1a' as Address,
+    LOCKER: '0x99595FB33e2599688b78F93569875c010648A359' as Address,
+    FEE_LOCKER: '0x343d77D94A119D5cEA495aeE8336A3a7Aa5CD385' as Address,
+    /** Cc0StakingEscrow — the 15% USDC slice, forwarded over CCTP V2 to the Base staking pool
+     *  (swapped to WETH there). */
+    STAKING: '0xE4542b52Ed212bDcFb10f3C9F8A12f2cEeeF35b2' as Address,
+    /** $cc0company lives on Base only — kept for shape parity. */
+    CC0COMPANY: '0x67c5F00491c09cbCF6359f95690574E6106bb3CF' as Address,
+    HOOK_STATIC_FEE: '0xaC20F9af70538700be01ad87538b117159B1E8Cc' as Address,
+    HOOK_DYNAMIC_FEE: '0x109010Fcd32c06e4c4EB9cc2d496970358bba8cc' as Address,
+    MEV_BLOCK_DELAY: '0x0De94068195C5d85e31406804357F44E0D20E255' as Address,
+    MEV_SNIPER_TAX: '0x70baFfe8783396142385Ece53f2cDF8D1cf9872C' as Address,
+    VAULT: '0xB8bC0bb444a65B1896D0557A273C5Be269d701C9' as Address,
+    AIRDROP_V2: '0xD4B6AE01Ddcb336DCcACcca28f02cC70195c0b8f' as Address,
+    /** NO dev buy on Arc — the dev-buy extension wraps ETH through WETH9, which Arc has none of.
+     *  Zero address: `devBuyEth` throws before any transaction is built. */
+    DEV_BUY_V4: '0x0000000000000000000000000000000000000000' as Address,
+    /** The STANDARD PAIR on Arc is USDC — the 6-decimal ERC-20 interface over the native
+     *  balance (same balance as the 18-decimal native gas). Every 75/15/10 pool is quoted in it. */
+    WETH: '0x3600000000000000000000000000000000000000' as Address,
+    PAIR_SYMBOL: 'USDC',
+    PAIR_DECIMALS: 6,
+    NFT_FEE_FACTORY: '0xF84D22728E7f4DdD56Fd3BE7Cb30148e727A8a1a' as Address,
+    NFT_REWARDS_ROUTER: '0x757711674f94d952d83b6b24CAe9ACA941554100' as Address,
   },
 } as const;
 
 /** Chain selector accepted everywhere in the SDK: a slug or a chain id. */
-export type Cc0Chain = 'base' | 'ethereum' | 'robinhood' | 8453 | 1 | 4663;
+export type Cc0Chain = 'base' | 'ethereum' | 'robinhood' | 'arc' | 8453 | 1 | 4663 | 5042;
 
 export type Cc0ChainSlug = keyof typeof CC0_CONTRACTS;
 
@@ -98,10 +139,26 @@ export const robinhoodChain: Chain = defineChain({
   },
 });
 
+/**
+ * Arc (5042) — Circle's L1. USDC is the native gas token (18-decimal native balance, 6-decimal
+ * ERC-20 interface at 0x3600…0000 over the SAME balance); 0.5 s blocks, instant finality.
+ * Not in viem's chain list yet, defined here.
+ */
+export const arcChain: Chain = defineChain({
+  id: 5042,
+  name: 'Arc',
+  nativeCurrency: { name: 'USD Coin', symbol: 'USDC', decimals: 18 },
+  rpcUrls: { default: { http: ['https://rpc.mainnet.arc.io'] } },
+  blockExplorers: {
+    default: { name: 'Arc Explorer', url: 'https://explorer.arc.io' },
+  },
+});
+
 /** Normalise a Cc0Chain (slug or id) to the canonical slug. Defaults to 'base'. */
 export function toChainSlug(chain?: Cc0Chain): Cc0ChainSlug {
   if (chain === 1 || chain === 'ethereum') return 'ethereum';
   if (chain === 4663 || chain === 'robinhood') return 'robinhood';
+  if (chain === 5042 || chain === 'arc') return 'arc';
   return 'base';
 }
 
@@ -110,6 +167,7 @@ export const CHAIN_IDS: Record<Cc0ChainSlug, number> = {
   base: 8453,
   ethereum: 1,
   robinhood: 4663,
+  arc: 5042,
 };
 
 /** Per-slug viem Chain object (for wallet/public clients). */
@@ -117,12 +175,16 @@ export const VIEM_CHAINS: Record<Cc0ChainSlug, Chain> = {
   base,
   ethereum: mainnet,
   robinhood: robinhoodChain,
+  arc: arcChain,
 };
 
 /**
  * Default public RPC per chain. Explicit URLs on purpose:
  *   • Ethereum — viem's default (eth.merkle.io) is CORS-blocked in browsers; publicnode isn't.
  *   • Robinhood — the official RPC (rate-limited but fine for launches).
+ *   • Arc — the OFFICIAL RPC only: it is the one whose txpool reaches the validators (the dRPC /
+ *     Blockdaemon mirrors are read-only in practice). Send one tx at a time; bursts answer
+ *     `-32003 txpool is full`.
  *   • Base — viem's default works; pinned here for symmetry.
  * Pass your own `publicClient` / `walletClient` (e.g. Alchemy-backed) for production volume.
  */
@@ -130,11 +192,18 @@ export const DEFAULT_RPCS: Record<Cc0ChainSlug, string> = {
   base: 'https://mainnet.base.org',
   ethereum: 'https://ethereum-rpc.publicnode.com',
   robinhood: 'https://rpc.mainnet.chain.robinhood.com',
+  arc: 'https://rpc.mainnet.arc.io',
 };
+
+/** The standard pair of a chain — what every 75/15/10 pool is quoted in (WETH, or USDC on Arc). */
+export function standardPairFor(chain?: Cc0Chain): { address: Address; symbol: string; decimals: number } {
+  const c = CC0_CONTRACTS[toChainSlug(chain)];
+  return { address: c.WETH, symbol: c.PAIR_SYMBOL, decimals: c.PAIR_DECIMALS };
+}
 
 /**
  * The protocol fee split, enforced ON-CHAIN by the factory at every launch — the SAME on all
- * three chains. Configs that drop or resize the staking/treasury slices revert
+ * four chains. Configs that drop or resize the staking/treasury slices revert
  * (Cc0InvalidProtocolSplit) — changing these constants only breaks your launch.
  */
 export const PROTOCOL_SPLIT = {
@@ -193,8 +262,9 @@ export interface Cc0PairedContracts {
 
 /**
  * Per-chain PAIRED ERC-20 launchpad deployments. LIVE on Base (8453) and Robinhood Chain (4663);
- * a chain with no entry (or an empty factory) makes `isCc0PairedAvailable()` false and every
- * paired ERC-20 launch there fail closed, so nothing can silently target a non-existent factory.
+ * a chain with no entry (or an empty factory — Ethereum, Arc today) makes `isCc0PairedAvailable()`
+ * false and every paired ERC-20 launch there fail closed, so nothing can silently target a
+ * non-existent factory.
  * Reused live infra (feeLocker/staking) is pre-filled — same shared fee locker as every launch.
  */
 export const CC0_PAIRED_CONTRACTS: Partial<Record<Cc0ChainSlug, Cc0PairedContracts>> = {

@@ -23,6 +23,7 @@ import {
   getCc0PairedContracts,
   PAIRED_SPLIT,
   PROTOCOL_SPLIT,
+  standardPairFor,
   toChainSlug,
   VAULT_MIN_LOCKUP_SECONDS,
   VIEM_CHAINS,
@@ -124,6 +125,56 @@ export function startingTickForPairedLaunch(opts: {
   if (tick > 887000) tick = 887000;
   if (tick < -887200) tick = -887200;
   return tick;
+}
+
+/**
+ * Starting tick for a STANDARD launch whose pool is quoted in a STABLECOIN instead of WETH
+ * (Arc: USDC, 6 decimals). The preset's FDV target is defined in ETH (degen ≈ 1.3 WETH); it is
+ * held constant in dollar terms at the live ETH/USD price — 1 USDC = 1/ethUsd WETH — and the
+ * decimals gap is folded in exactly as for a paired launch. Fail-closed: no ETH/USD, no tick.
+ * (At the raw preset tick an Arc pool would open at ~1e-12 of the intended price and the first
+ * buy would drain it — the same invariant as startingTickForSupply.)
+ */
+export function startingTickForStablePair(opts: {
+  preset: Cc0LpPreset;
+  supplyWhole: number;
+  /** Live ETH/USD price (the stable is assumed $1). */
+  ethUsd: number;
+  /** The stablecoin's decimals (USDC on Arc: 6). */
+  pairDecimals: number;
+}): number {
+  if (!Number.isFinite(opts.ethUsd) || opts.ethUsd <= 0) {
+    throw new Error('ETH/USD price unavailable — cannot price a USDC-quoted pool safely.');
+  }
+  return startingTickForPairedLaunch({
+    preset: opts.preset,
+    supplyWhole: opts.supplyWhole,
+    pairedPriceWeth: 1 / opts.ethUsd,
+    pairedDecimals: opts.pairDecimals,
+  });
+}
+
+/**
+ * Live ETH/USD from the cc0.company price API (Base WETH's USD price — the shared backend
+ * snapshot every visitor reads). Used to price USDC-quoted standard pools (Arc). Fail-closed:
+ * returns null when the API does not answer with a positive number.
+ */
+export async function fetchEthUsd(registryUrl: string): Promise<number | null> {
+  try {
+    const weth = '0x4200000000000000000000000000000000000006';
+    const url =
+      `${registryUrl.replace(/\/$/, '')}/api/store/token-prices` +
+      `?addresses=${weth}&types=external&chains=base&holders=0`;
+    const res = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined,
+    });
+    const json = res.ok ? await res.json().catch(() => null) : null;
+    const usd = Number((json?.prices ?? {})[weth]?.price_usd ?? 0);
+    return Number.isFinite(usd) && usd > 0 ? usd : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Implied launch FDV (in WETH) at a given tick — the preview + clamp-guard companion
@@ -322,8 +373,15 @@ export interface LaunchTokenParams {
     /** Inline leaves JSON string (small sets / legacy) — recorded as airdrop_entries_json. */
     entriesJson?: string;
   };
-  /** Optional dev buy: ETH spent buying the token at launch (e.g. "0.05"). */
+  /** Optional dev buy: ETH spent buying the token at launch (e.g. "0.05"). Not available on
+   *  Arc (no WETH there — the extension wraps ETH through WETH9); the SDK throws. */
   devBuyEth?: string;
+  /**
+   * USDC-quoted chains only (Arc): the ETH/USD price used to hold the preset's FDV target
+   * constant in dollars. Explicit value wins; when omitted the SDK reads Base WETH's USD price
+   * from the cc0.company price API. Fail-closed: no price, no launch. Ignored elsewhere.
+   */
+  quoteEthUsd?: number;
   /**
    * Liquidity profile — 'degen' (DEFAULT, ~$5k starting FDV, thin: the price needs ~7×
    * less volume to move) or 'classic' (~$36k starting FDV, deep). The default matches
@@ -481,10 +539,11 @@ export interface ExternalSender {
 
 export interface Cc0ClientConfig {
   /**
-   * Chain to operate on: 'base' (default) | 'ethereum' | 'robinhood' — or the
-   * chain id (8453 | 1 | 4663). Drives the contract addresses, the default
+   * Chain to operate on: 'base' (default) | 'ethereum' | 'robinhood' | 'arc' — or the
+   * chain id (8453 | 1 | 4663 | 5042). Drives the contract addresses, the default
    * clients' network, the tx `chainId`, and the registry record. Your
-   * walletClient/publicClient (if provided) must be on the SAME chain.
+   * walletClient/publicClient (if provided) must be on the SAME chain. On Arc the gas
+   * token is USDC and every pool is quoted in USDC (see standardPairFor).
    */
   chain?: Cc0Chain;
   /** Viem WalletClient with an account (wagmi compatible), on the configured chain. */
@@ -659,9 +718,9 @@ export class Cc0Launchpad {
   public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
-  /** Canonical chain slug ('base' | 'ethereum' | 'robinhood') this instance targets. */
+  /** Canonical chain slug ('base' | 'ethereum' | 'robinhood' | 'arc') this instance targets. */
   public readonly chainSlug: Cc0ChainSlug;
-  /** Numeric chain id (8453 | 1 | 4663). */
+  /** Numeric chain id (8453 | 1 | 4663 | 5042). */
   public readonly chainId: number;
   /** viem Chain object for the configured chain (used on every signed tx). */
   public readonly chain: (typeof VIEM_CHAINS)[Cc0ChainSlug];
@@ -669,8 +728,9 @@ export class Cc0Launchpad {
   public readonly registryUrl: string;
 
   constructor(config: Cc0ClientConfig = {}) {
-    // Per-chain wiring: 'base' (default) | 'ethereum' | 'robinhood'. Same factory
-    // semantics + enforced split on all three; only addresses/network differ.
+    // Per-chain wiring: 'base' (default) | 'ethereum' | 'robinhood' | 'arc'. Same factory
+    // semantics + enforced split on all four; only addresses/network (and, on Arc, the
+    // USDC quote asset) differ.
     this.chainSlug = toChainSlug(config.chain);
     this.chainId = CHAIN_IDS[this.chainSlug];
     this.chain = VIEM_CHAINS[this.chainSlug];
@@ -1326,12 +1386,38 @@ export class Cc0Launchpad {
           DEV_BUY_V4: c.DEV_BUY_V4,
         };
 
+    // No dev buy where the chain has no WETH (Arc): the extension wraps ETH through WETH9.
+    const pair = standardPairFor(this.chainSlug);
+    const stableQuoted = pair.symbol !== 'WETH';
+    if (stableQuoted && p.devBuyEth && Number(p.devBuyEth) > 0) {
+      throw new Error(`Dev buy is not available on ${this.chainSlug} — its pools are quoted in ${pair.symbol}, not WETH.`);
+    }
+
     // Paired pools are priced in the PAIRED token, so the preset tick (a WETH price)
     // is recomputed from the live paired price; the [0.5, 2] implied-FDV guard throws
-    // when tick clamping would deploy a broken pool.
-    const startingTick = paired
-      ? guardedPairedStartingTick(lpPreset, DEFAULT_SUPPLY_WHOLE, paired)
-      : LP_PRESETS[lpPreset].startingTick;
+    // when tick clamping would deploy a broken pool. A STABLE-quoted standard pool (Arc,
+    // USDC 6 dec) is re-ticked the same way at the live ETH/USD so the preset's FDV holds
+    // in dollars — fail-closed on a missing price.
+    let startingTick: number;
+    if (paired) {
+      startingTick = guardedPairedStartingTick(lpPreset, DEFAULT_SUPPLY_WHOLE, paired);
+    } else if (stableQuoted) {
+      const ethUsd = p.quoteEthUsd ?? (await fetchEthUsd(this.registryUrl));
+      if (!Number.isFinite(ethUsd as number) || (ethUsd as number) <= 0) {
+        throw new Error(
+          `Could not resolve ETH/USD from the cc0.company price API — pass quoteEthUsd explicitly. ` +
+            `${pair.symbol}-quoted launches fail closed: no price, no launch.`,
+        );
+      }
+      startingTick = startingTickForStablePair({
+        preset: lpPreset,
+        supplyWhole: DEFAULT_SUPPLY_WHOLE,
+        ethUsd: ethUsd as number,
+        pairDecimals: pair.decimals,
+      });
+    } else {
+      startingTick = LP_PRESETS[lpPreset].startingTick;
+    }
 
     // Pin the image FIRST — its URI goes on-chain forever, so permanence is
     // guaranteed before any transaction is built (fail-closed by default).
@@ -1692,7 +1778,9 @@ export async function resolvePairedToken(
     throw new Error(`pairedToken.address is not a valid ERC-20 address (got: ${String(address)}).`);
   }
   if (address.toLowerCase() === opts.weth.toLowerCase()) {
-    throw new Error('pairedToken is WETH — that IS the standard launch; omit pairedToken.');
+    throw new Error(
+      'pairedToken is the standard pair (WETH — USDC on Arc) — that IS the standard launch; omit pairedToken.',
+    );
   }
 
   // symbol()/decimals() straight from the chain — any ERC-20 qualifies IF both resolve.

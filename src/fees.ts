@@ -59,7 +59,9 @@ const FEE_LOCKER_ABI = [
 ] as const;
 
 export interface ClaimableFees {
-  /** Claimable WETH (wei). Always 0 for paired launches (their pool has no WETH). */
+  /** Claimable standard-pair amount, in its smallest unit — WETH (wei) on Base / Ethereum /
+   *  Robinhood Chain, USDC (6 decimals) on Arc (see standardPairFor). Always 0 for paired
+   *  launches (their pool has no standard-pair leg). */
   weth: bigint;
   /** Claimable launched-token amount (wei). */
   token: bigint;
@@ -107,7 +109,7 @@ export class Cc0Fees {
   public readonly sender?: ExternalSender;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   public readonly publicClient: any;
-  /** Chain this instance reads/claims on ('base' default | 'ethereum' | 'robinhood'). */
+  /** Chain this instance reads/claims on ('base' default | 'ethereum' | 'robinhood' | 'arc'). */
   public readonly chainSlug: Cc0ChainSlug;
   public readonly chainId: number;
   public readonly chain: (typeof VIEM_CHAINS)[Cc0ChainSlug];

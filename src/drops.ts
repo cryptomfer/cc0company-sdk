@@ -492,9 +492,9 @@ export class Cc0Drops {
 
   constructor(config: Cc0DropsConfig = {}) {
     this.chainSlug = toChainSlug(config.chain);
-    if (this.chainSlug === 'robinhood') {
+    if (this.chainSlug === 'robinhood' || this.chainSlug === 'arc') {
       throw new Error(
-        "NFT drops are not deployed on Robinhood Chain — pass chain: 'base' (default) or 'ethereum'.",
+        "NFT drops are not deployed on Robinhood Chain or Arc — pass chain: 'base' (default) or 'ethereum'.",
       );
     }
     this.chain = VIEM_CHAINS[this.chainSlug];

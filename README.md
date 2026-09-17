@@ -3,22 +3,28 @@
 The official [cc0.company](https://cc0.company) SDK. Launch tokens on the launchpad,
 claim creator fees, and stake $cc0company — from any website, app, or AI agent.
 
-- **`Cc0Launchpad`** — deploy a token on **Base, Ethereum, or Robinhood Chain** in one
+- **`Cc0Launchpad`** — deploy a token on **Base, Ethereum, Robinhood Chain or Arc** in one
   transaction, with the on-chain enforced **75/15/10** fee split: 75% of every trade's
-  LP fee to you, 15% to $cc0company stakers, 10% to the platform. Or pair the pool with
+  LP fee to you, 15% to $cc0company stakers, 10% to the platform. New in 1.14.0: **Arc**
+  (Circle's L1, chain 5042) — USDC is the gas token and every pool is quoted in USDC; the
+  SDK re-ticks the pool at the live ETH/USD so the preset's starting FDV holds in dollars
+  (fail-closed), and dev buys are refused there (no WETH on Arc). Or pair the pool with
   **any ERC-20 instead of WETH** — an 80/20 paired launch (LIVE on Base mainnet for both ERC-20s and B20s). New in 1.11.0: gas-sponsored launches, the platform pays the deploy gas on Base + Robinhood Chain (launchTokenSponsored / launchB20Sponsored, zero ETH needed).
 - **`Cc0Fees`** — read and claim your accrued trading fees (WETH + your token), on the
   chain you launched on.
 - **`Cc0Staking`** — stake $cc0company (on Base) and earn WETH from every launch on
-  every chain — the Ethereum and Robinhood Chain staking slices bridge to the Base pool.
+  every chain — the Ethereum and Robinhood Chain staking slices bridge to the Base pool,
+  and the Arc slice (USDC) crosses over CCTP V2 and is swapped to WETH on Base.
 - **`Cc0Drops`** — the full IPFS NFT drop lifecycle (CC0Drop ERC721-C + CC0Drop1155):
   pin art + metadata, deploy in one signature, record on cc0.company, then manage the
   drop exactly like the dashboard — phases, allowlists (merkle), royalties, airdrops,
   open-edition numbering, NEW editions on a live 1155, withdraw, seal — and mint.
 
 ```ts
-// Pick the chain at construction — 'base' (default) | 'ethereum' | 'robinhood':
-const launchpad = new Cc0Launchpad({ account, chain: 'robinhood' });
+// Pick the chain at construction — 'base' (default) | 'ethereum' | 'robinhood' | 'arc':
+const launchpad = new Cc0Launchpad({ account, chain: 'arc' });
+// Arc: gas is USDC (fund the wallet with USDC on Arc), pools are quoted in USDC, no dev buy.
+// The SDK reads ETH/USD from cc0.company to place the starting tick — or pass quoteEthUsd.
 ```
 
 One peer dependency: [viem](https://viem.sh).
